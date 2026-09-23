@@ -512,6 +512,65 @@ core.advance_campaign(cd, "第一版", sti)  # 达上限 → done
 core.advance_campaign(cd, "第一版", sti)  # 即便相同也不应因停滞逻辑改写（已 done 不活跃）
 check("达上限为 done 不被停滞逻辑覆盖", core.campaign_by_id(sti, cd["id"])["status"] == "done")
 
+# ================================================================ 16. 阶段2：迭代引擎健壮性
+print("\n== 16. 阶段2 加固：回复捕获回退 / 防死锁自愈 / 无代码改动停滞 ==")
+# 16.1 回复捕获回退：CDP 无回复时改读缓存文件
+reply_file = _TMP / "campaign_reply.txt"
+reply_file.write_text("缓存回复：已修复导入顺序。", encoding="utf-8")
+cfg_r = cfg_of()
+cfg_r.setdefault("auto_send", {})["reply_cache_file"] = str(reply_file)
+cr = core.create_campaign(fresh_state(), "目标")
+FAKE["reply"] = None
+got = core.try_capture_campaign_result(cr, cfg_r)
+check("CDP 无回复→回退读缓存文件", got == "缓存回复：已修复导入顺序。", f"实际={got}")
+reply_file.unlink(missing_ok=True)
+
+# 16.2 防死锁自愈：在途回复超时且 CDP 无回复 → 记一次失败并续跑
+sg = fresh_state()
+sg["model_catalog"] = [{"name": "FreeA", "free": True}]
+cg = core.create_campaign(sg, "目标", strategy="improve", max_iterations=0)
+core.ensure_campaign_task(cg, sg, cfg2, t_at(2))
+cam = core.campaign_by_id(sg, cg["id"])
+cam["awaiting_result_at"] = "2026-09-23 00:00:00"   # 置于免费时段之前（已超时）
+core.save_state(sg)
+core.update_task(cg["last_task_id"], status="sent")  # 须在 save_state 之后，否则会被内存态覆盖
+FAKE["reply"] = None
+core.run_iteration_step(core.load_state(), cfg2, t_at(2))
+cgr = core.campaign_by_id(core.load_state(), cg["id"])
+check("在途回复超时→记一次失败(错误自愈)", cgr["error_count"] == 1, f"实际={cgr['error_count']}")
+check("超时自愈后保持活跃续跑", cgr["status"] == "running", f"实际={cgr['status']}")
+check("_await_stale 旧时间戳→True", core._await_stale({"awaiting_result_at": "2026-09-23 00:00:00"}, cfg2, t_at(2)) is True)
+check("_await_stale 无时间戳→False", core._await_stale({}, cfg2, t_at(2)) is False)
+
+# 16.3 停滞检测增强：git 仓库连续多轮"只说话不改代码" → 暂停
+import subprocess as _sp
+_gitdir = Path(tempfile.mkdtemp(prefix="wbgit_"))
+try:
+    _sp.run(["git", "init", str(_gitdir)], capture_output=True, timeout=15, check=True)
+    (_gitdir / "seed.py").write_text("x = 1\n", encoding="utf-8")
+    _sp.run(["git", "-C", str(_gitdir), "add", "-A"], capture_output=True, timeout=15)
+    _sp.run(["git", "-C", str(_gitdir), "commit", "-m", "init"], capture_output=True, timeout=15)
+    cnr = core.create_campaign(fresh_state(), "目标", strategy="improve",
+                               max_iterations=0, repo_path=str(_gitdir))
+    core.advance_campaign(cnr, "本轮只讨论方案，未动代码。", fresh_state())
+    core.advance_campaign(cnr, "继续讨论，仍未改代码。", fresh_state())
+    check("git 仓库连续2轮无代码改动→暂停", cnr["status"] == "paused", f"实际={cnr['status']}")
+    check("无代码改动触发 stagnation", cnr.get("stagnation") is True
+          and cnr.get("no_code_change_count", 0) >= 2, f"cnt={cnr.get('no_code_change_count')}")
+    # 改动代码后计数应清零
+    (_gitdir / "seed.py").write_text("x = 2\n", encoding="utf-8")
+    cnr2 = core.create_campaign(fresh_state(), "目标", strategy="improve",
+                                max_iterations=0, repo_path=str(_gitdir))
+    core.advance_campaign(cnr2, "改了 seed.py。", fresh_state())
+    check("检测到代码改动→no_code_change 清零", cnr2.get("no_code_change_count", 1) == 0,
+          f"实际={cnr2.get('no_code_change_count')}")
+except Exception as e:  # noqa: BLE001
+    check("git 停滞检测(环境无 git 则跳过)", True, f"skip: {e}")
+finally:
+    import shutil
+    shutil.rmtree(_gitdir, ignore_errors=True)
+check("_repo_has_code_change 非 git 目录→None", core._repo_has_code_change(str(_TMP)) is None)
+
 # ================================================================ 汇总
 print("\n" + "=" * 56)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")

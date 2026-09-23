@@ -531,6 +531,76 @@ def _truncate(s, n=800):
     return s[:n] + ("…" if len(s) > n else "")
 
 
+# ---------------------------------------------------------------------------
+# 自动迭代引擎·健壮性常量与辅助（阶段2：停滞检测 / 错误自愈 / 回复捕获）
+# ---------------------------------------------------------------------------
+REPLY_CACHE_FILE = "campaign_reply.txt"   # 回复捕获回退文件：CDP 读不到时由接收方写入
+AWAIT_RESULT_TIMEOUT = 1800               # 在途回复最长等待秒数；超时按失败自愈，防死锁
+
+
+def _await_result_timeout(cfg):
+    try:
+        return int((cfg.get("auto_send", {}) or {}).get("await_timeout") or AWAIT_RESULT_TIMEOUT)
+    except (ValueError, TypeError):
+        return AWAIT_RESULT_TIMEOUT
+
+
+def _await_stale(camp, cfg, now):
+    """在途回复是否已超过等待上限（用于防死锁自愈）。无时间戳则视为未超时。"""
+    ts = camp.get("awaiting_result_at")
+    if not ts:
+        return False
+    try:
+        dt = _parse_dt(ts)
+    except Exception:
+        return False
+    if dt is None:
+        return False
+    return (now - dt).total_seconds() > _await_result_timeout(cfg)
+
+
+def _reply_cache_path(cfg):
+    p = (cfg.get("auto_send", {}) or {}).get("reply_cache_file") or REPLY_CACHE_FILE
+    return Path(p)
+
+
+def _read_reply_cache_file(camp, cfg):
+    """回退源：读取回复缓存文件（CDP DOM 读不到时，可让接收方把最终回复写入此文件）。"""
+    try:
+        fp = _reply_cache_path(cfg)
+        if fp.is_file():
+            txt = fp.read_text(encoding="utf-8", errors="ignore").strip()
+            if txt:
+                return txt
+    except Exception:
+        pass
+    return None
+
+
+def _repo_has_code_change(repo):
+    """repo 指向 git 仓库时，返回本轮是否有 .py 代码改动；非 git 仓库/异常返回 None。
+    用于停滞检测增强：若连续多轮只说话不改代码，判定为无进展。"""
+    try:
+        rp = Path(repo)
+        if not rp.is_dir() or not (rp / ".git").exists():
+            return None
+        out = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
+                             cwd=str(rp), capture_output=True, text=True, timeout=15)
+        if out.returncode != 0:
+            return None
+        changed = [ln for ln in out.stdout.splitlines()
+                   if ln.strip() and ln.strip()[2:].endswith(".py")]
+        if changed:
+            return True
+        out2 = subprocess.run(["git", "diff", "--stat", "HEAD", "--", "*.py"],
+                             cwd=str(rp), capture_output=True, text=True, timeout=15)
+        if out2.returncode == 0 and out2.stdout.strip():
+            return True
+        return False
+    except Exception:
+        return None
+
+
 def ensure_campaigns(state):
     state.setdefault("campaigns", [])
     for c in state["campaigns"]:
@@ -539,7 +609,9 @@ def ensure_campaigns(state):
         c.setdefault("current_iteration", 0)
         c.setdefault("error_count", 0)
         c.setdefault("awaiting_result", False)
+        c.setdefault("awaiting_result_at", "")
         c.setdefault("last_task_id", None)
+        c.setdefault("no_code_change_count", 0)
         c.setdefault("last_prompt", "")
         c.setdefault("last_result", "")
         c.setdefault("stages", [])
@@ -581,8 +653,10 @@ def create_campaign(state, goal, strategy="improve", model="", stages=None,
         "last_result": "",
         "last_task_id": None,
         "awaiting_result": False,
+        "awaiting_result_at": "",
         "error_count": 0,
         "stagnation": False,
+        "no_code_change_count": 0,
         "history": [],
     }
     camps.append(camp)
@@ -704,6 +778,14 @@ def advance_campaign(camp, result, state):
         camp["error_count"] = camp.get("error_count", 0) + 1
     else:
         camp["error_count"] = 0
+    # 停滞检测增强：repo 模式检测"多轮只说话不改代码"
+    repo = camp.get("repo_path")
+    if repo and not _looks_failed(result):
+        changed = _repo_has_code_change(repo)
+        if changed is False:
+            camp["no_code_change_count"] = camp.get("no_code_change_count", 0) + 1
+        elif changed is True:
+            camp["no_code_change_count"] = 0
     # 停止条件
     if camp["max_iterations"] and camp["current_iteration"] >= camp["max_iterations"]:
         camp["status"] = "done"
@@ -722,6 +804,11 @@ def advance_campaign(camp, result, state):
                 camp["stagnation"] = True
                 log(f"迭代活动 #{camp['id']} 连续 2 轮输出几乎相同，已自动暂停"
                     f"（疑似无进展，请检查目标任务是否仍可优化）")
+            elif camp.get("no_code_change_count", 0) >= 2:
+                camp["status"] = "paused"
+                camp["stagnation"] = True
+                log(f"迭代活动 #{camp['id']} 连续 {camp['no_code_change_count']} 轮无代码改动，"
+                    f"已自动暂停（疑似无进展，请检查目标任务是否仍可优化）")
     save_state(state)
 
 
@@ -747,6 +834,7 @@ def ensure_campaign_task(camp, state, cfg, now):
     update_task(task["id"], campaign_id=camp["id"], model=model)
     camp["last_prompt"] = prompt
     camp["awaiting_result"] = True
+    camp["awaiting_result_at"] = (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     camp["last_task_id"] = task["id"]
     save_state(state)
     log(f"迭代活动 #{camp['id']} 已生成第 {camp['current_iteration'] + 1} 轮任务"
@@ -755,14 +843,20 @@ def ensure_campaign_task(camp, state, cfg, now):
 
 
 def try_capture_campaign_result(camp, cfg, timeout=240, poll=15):
-    """尝试读取 WorkBuddy 对 camp.last_task_id 的回复。返回文本或 None（未就绪/超时/不可用）。"""
+    """尝试读取 WorkBuddy 对 camp.last_task_id 的回复。返回文本或 None（未就绪/超时/不可用）。
+    捕获顺序：① WorkBuddy CDP DOM ② 回复缓存文件（CDP 读不到时由接收方写入）。"""
     try:
         import workbuddy_cdp
         msg = workbuddy_cdp.last_assistant_message(timeout=timeout, poll=poll)
         if msg:
             return msg
     except Exception as e:
-        log(f"迭代读取 WorkBuddy 回复失败(可忽略): {e}")
+        log(f"迭代读取 WorkBuddy 回复失败(CDP, 尝试回退源): {e}")
+    # 回退源：回复缓存文件
+    cached = _read_reply_cache_file(camp, cfg)
+    if cached:
+        log("迭代回复改由缓存文件捕获（CDP DOM 不可用）")
+        return cached
     return None
 
 
@@ -787,7 +881,18 @@ def run_iteration_step(state, cfg, now=None):
                     # 成功推进后，若活动仍活跃，立即生成下一轮任务（同一轮内连续迭代）
                     if camp.get("status") == "running":
                         ensure_campaign_task(camp, state, cfg, now)
-                # 未捕获到（CDP 不可用或仍在流式输出）则保持 awaiting，下轮继续
+                elif _await_stale(camp, cfg, now):
+                    # 防死锁自愈：在途回复超过等待上限仍未捕获到（CDP/网络异常或回复捕获失败），
+                    # 以"无回复"作为失败推进，触发错误计数→连续多次后自动暂停，避免无限空转。
+                    log(f"迭代活动 #{camp['id']} 在途回复超时，按失败自愈并续跑")
+                    advance_campaign(
+                        camp,
+                        "【引擎自愈】在途任务超过等待上限仍未捕获到回复"
+                        "（可能 CDP/网络异常或回复捕获失败），本轮记为失败。",
+                        state)
+                    if camp.get("status") == "running":
+                        ensure_campaign_task(camp, state, cfg, now)
+                # 未超时也未捕获（CDP 不可用或仍在流式输出）则保持 awaiting，下轮继续
                 continue
             else:
                 # 仍在 pending：等统一调度循环发送
