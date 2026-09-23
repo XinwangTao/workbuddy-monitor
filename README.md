@@ -174,8 +174,19 @@ python workbuddy_monitor.py --pause-iter 123456  # 暂停 / --resume-iter 恢复
 无需真实 WorkBuddy 即可验证全部核心逻辑（CDP 用伪造模块注入，状态写入临时目录，不污染仓库）：
 
 ```bash
-python test_core.py        # 145 项：免费判定/调度/迭代引擎/发送通道/限流解析/阶段2健壮性
-python test_gui_smoke.py   # 15 项：界面构建、定时填充、迭代窗口（需带 tkinter 的 Python）
+python test_core.py          # 核心逻辑离线测试（145 项）
+python test_e2e_real.py      # 实测：无 CDP 时回退/免费门控/白天不发送
+python test_e2e_cdp.py       # 实测：注入 Fake CDP 的「夜间 hy4 免费」自动迭代闭环
+python test_e2e_hy3_day.py   # 实测：白天 hy3 免费自动迭代闭环（按模型专属时段自动选模型）
+python test_gui_smoke.py     # GUI 构建冒烟（15 项，需带 tkinter 的 Python；无 tkinter 时自动跳过）
+```
+
+一键跑全部（与 CI 同款）：
+
+```bash
+python test_core.py && python test_e2e_real.py && python test_e2e_cdp.py && python test_e2e_hy3_day.py \
+  && python test_gui_smoke.py \
+  && python -m py_compile workbuddy_monitor.py workbuddy_cdp.py workbuddy_gui.py && echo "ALL OK"
 ```
 
 **免费判定**部分是安全关键——宁可漏判（任务继续排队），也绝不把付费模型误判成免费，否则会真扣积分。
@@ -189,7 +200,10 @@ python test_gui_smoke.py   # 15 项：界面构建、定时填充、迭代窗口
 ├── workbuddy_cdp.py       # CDP 驱动（读取模型/回复/余额）
 ├── launch_workbuddy.vbs   # 一键启动器（WorkBuddy + GUI）
 ├── test_core.py           # 核心逻辑离线测试（无需 WorkBuddy）
-├── test_gui_smoke.py      # GUI 构建冒烟测试
+├── test_e2e_real.py       # 端到端实测：无 CDP 回退 / 免费门控 / 白天不发送
+├── test_e2e_cdp.py        # 端到端实测：注入 Fake CDP 的夜间 hy4 免费迭代闭环
+├── test_e2e_hy3_day.py    # 端到端实测：白天 hy3 免费迭代闭环（模型专属时段）
+├── test_gui_smoke.py      # GUI 构建冒烟测试（需 tkinter）
 └── README.md
 ```
 
