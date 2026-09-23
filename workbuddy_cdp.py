@@ -228,11 +228,34 @@ def _f(v):
 _JS_LIST_MODELS = """
 (() => {
   const items = [...document.querySelectorAll('.cr-model-selector__item')];
-  return JSON.stringify(items.map(it => ({
-    name: (it.querySelector('.cr-model-selector__item-name')?.textContent || '').trim(),
-    badge: (it.querySelector('.cr-model-selector__item-badge')?.textContent || '').trim(),
-    text: (it.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 60)
-  })));
+  return JSON.stringify(items.map(it => {
+    const name = (it.querySelector('.cr-model-selector__item-name')?.textContent || '').trim();
+    const badge = (it.querySelector('.cr-model-selector__item-badge')?.textContent || '').trim();
+    // 描述/提示行：部分版本把「每日 23:00-08:00 免费」写在子元素里
+    const desc = (it.querySelector('.cr-model-selector__item-desc')?.textContent
+               || it.querySelector('[class*="desc"]')?.textContent
+               || it.querySelector('[class*="tip"]')?.textContent || '').trim();
+    const text = (it.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 160);
+    return {name, badge, desc, text};
+  }));
+})()
+"""
+
+# 从页面 DOM 发现全局免费时段（闲时夜间窗口）。
+# 先扫含「免费/免/闲时/夜间/错峰」上下文的时间范围，再退化为全文首个 HH:MM-HH:MM。
+_JS_FIND_FREE_WINDOW = r"""
+(() => {
+  const pat = /(免费|免|闲时|夜间|错峰|限免)[^\n]{0,40}?(\d{1,2}):(\d{2})\s*[-~到至]\s*(\d{1,2}):(\d{2})/;
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let n;
+  while ((n = walker.nextNode())) {
+    const m = n.nodeValue && n.nodeValue.match(pat);
+    if (m) return JSON.stringify({start: m[2]+':'+m[3], end: m[4]+':'+m[5], ctx: n.nodeValue.trim().slice(0, 60)});
+  }
+  const body = document.body ? (document.body.innerText || '') : '';
+  const m2 = body.match(/(\d{1,2}):(\d{2})\s*[-~到至]\s*(\d{1,2}):(\d{2})/);
+  if (m2) return JSON.stringify({start: m2[1]+':'+m2[2], end: m2[3]+':'+m2[4], ctx: 'body'});
+  return null;
 })()
 """
 
@@ -288,6 +311,79 @@ def list_models():
 def current_model():
     """读取当前选中模型名"""
     return _evaluate(_JS_CURRENT_MODEL) or None
+
+
+# 读取 WorkBuddy 最新助手回复时尝试的选择器（命中其一即可）。
+# 不同版本 DOM 结构可能不同，可在 config.json 里覆盖 workbuddy_cdp.REPLY_SELECTORS。
+REPLY_SELECTORS = [
+    ".cr-chat-message--assistant",
+    '[class*="assistant" i]',
+    '[data-role="assistant"]',
+    ".message-list .message:last-child",
+    '[class*="message" i]:last-of-type',
+]
+
+
+def last_assistant_message(timeout=240, poll=15):
+    """读取 WorkBuddy 当前会话最新一条助手消息文本。
+    通过轮询等待文本稳定（不再变化）后返回，避免截取到一半的流式输出。
+    CDP 不可用 / 读不到时返回 None。"""
+    js = r"""
+    (() => {
+      const sels = %s;
+      let el = null;
+      for (const s of sels) {
+        try {
+          const nodes = document.querySelectorAll(s);
+          if (nodes.length) { el = nodes[nodes.length - 1]; break; }
+        } catch (e) {}
+      }
+      if (!el) {
+        const area = document.querySelector('[class*="chat" i]') || document.body;
+        const blocks = [...area.querySelectorAll('div, p, span, pre, code')]
+          .filter(n => (n.innerText || n.textContent || '').trim().length > 20);
+        el = blocks[blocks.length - 1] || null;
+      }
+      if (!el) return null;
+      const t = (el.innerText || el.textContent || '').trim();
+      return t ? t.slice(0, 4000) : null;
+    })()
+    """ % json.dumps(REPLY_SELECTORS)
+
+    deadline = time.time() + max(poll, timeout)
+    last = None
+    while time.time() < deadline:
+        try:
+            val = _evaluate(js, timeout=poll + 5)
+        except Exception:
+            val = None
+        if val:
+            # 等文本稳定再返回
+            try:
+                stable = _evaluate(js, timeout=poll + 5)
+            except Exception:
+                stable = val
+            if stable == val:
+                return val
+            last = val
+        time.sleep(poll)
+    return None
+
+
+def discover_free_window_dom():
+    """从 WorkBuddy 页面 DOM 发现全局免费时段（闲时夜间窗口）。
+    返回 {start, end, ctx} 或 None（CDP 不可用 / 页面无时段信息）。"""
+    raw = _evaluate(_JS_FIND_FREE_WINDOW, timeout=10)
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        sh, sm = int(d["start"].split(":")[0]), int(d["start"].split(":")[1])
+        eh, em = int(d["end"].split(":")[0]), int(d["end"].split(":")[1])
+        return {"start": f"{sh:02d}:{sm:02d}", "end": f"{eh:02d}:{em:02d}",
+                "ctx": d.get("ctx", "")}
+    except Exception:
+        return None
 
 
 def select_model(name):

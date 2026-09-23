@@ -73,6 +73,10 @@ DEFAULT_CONFIG = {
             "start": "23:00",
             "end": "08:00",
         },
+        # 从 WorkBuddy 底层（模型选择器 / 页面 DOM）动态发现免费模型与免费时段，
+        # 发现不到时回退到上面的 free_window 配置（官方口径 23:00-08:00）。
+        "discover_free_models": True,   # 枚举模型选择器，标注哪些模型免费
+        "discover_free_window": True,   # 从页面 DOM 发现闲时夜间免费时段
     },
 }
 
@@ -116,6 +120,7 @@ def load_state() -> dict:
                 raise ValueError("state root is not a dict")
             data.setdefault("tasks", [])
             data.setdefault("rate_limits", {})
+            data.setdefault("campaigns", [])
             return data
         except Exception as e:
             import shutil
@@ -154,46 +159,327 @@ def log(msg: str):
 # ---------------------------------------------------------------------------
 # 匹配 "Hy4 preview模型" / "Hy4 preview 模型"
 MODEL_RE = re.compile(r"您在\s*(.+?)\s*模型的使用量已超出频率限制")
-# 匹配 "可在2026-09-09 19:30:24 重置可用" 或 "可在2026-09-09 19:30:24 重置"
-TIME_RE = re.compile(r"可在\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*重置")
+# 变体文案：部分版本不写"您在…使用量已超出…"，例如 "模型 Hy4 preview 已限流"
+MODEL_RE2 = re.compile(r"(?:模型\s*[:：]?\s*)?([A-Za-z0-9][\w.\- ]{0,40}?)\s*(?:模型)?\s*(?:已|被)?\s*限流")
+# 秒数可省略：真实消息里也可能写成 "2026-09-09 19:30"（缺秒必须能解析，否则检测不到限流）
+TIME_RE = re.compile(r"可在\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)\s*重置")
 # 备用：只要时间
-TIME_RE2 = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+TIME_RE2 = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)")
+
+
+def _parse_dt(s: str):
+    """解析 'YYYY-MM-DD HH:MM[:SS]'，缺秒时补 :00；非法返回 None"""
+    s = (s or "").strip()
+    if len(s) == 16:
+        s += ":00"
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
 
 
 def parse_rate_limit_message(text: str):
     """解析限流消息，返回 (model, reset_time: datetime|None, ok)"""
     model = None
     reset = None
-    m = MODEL_RE.search(text)
+    # 主文案优先；匹配不到再试变体文案（如 "模型 X 已限流"）
+    m = MODEL_RE.search(text) or MODEL_RE2.search(text)
     if m:
         model = m.group(1).strip()
-    t = TIME_RE.search(text)
+    t = TIME_RE.search(text) or TIME_RE2.search(text)
     if t:
-        reset = datetime.strptime(t.group(1), "%Y-%m-%d %H:%M:%S")
-    else:
-        t2 = TIME_RE2.search(text)
-        if t2:
-            reset = datetime.strptime(t2.group(1), "%Y-%m-%d %H:%M:%S")
+        reset = _parse_dt(t.group(1))
     return model, reset, (model is not None or reset is not None)
+
+
+# ---------------------------------------------------------------------------
+# 免费模型 / 免费时段 动态发现（从 WorkBuddy 底层 = 模型选择器 / 页面 DOM）
+# ---------------------------------------------------------------------------
+# 官方口径（腾讯 WorkBuddy 联合团队公告）：老用户夜间 23:00-次日 08:00 继续免费，
+# 其余时间消耗积分；免费仅限对话（纯文本），画图/视频走多模态模型扣积分。
+# 免费判定（正则，不区分大小写）：语义明确的关键词。
+# 用 (?<!\d)0\s*积分 而非 "0积分" 子串，避免 "10积分" 被误判为免费；
+# "免积分"/"不计费"/"限免" 等也归入免费语义。
+FREE_PATTERNS = [
+    r"免费", r"限免", r"free",
+    r"(?<!\d)0\s*积分",   # 0积分 / 0 积分（排除 10积分 等正成本）
+    r"免\s*积分",          # 免积分
+    r"不计费",             # 不计费
+    r"夜间免费", r"闲时免费",
+]
+# 免费判定（徽标精确匹配）：短词做子串匹配会误判——
+#   "x0.5"(半价) 含 "x0"、"避免限流" 含 "免"、"免疫" 含 "免"，
+#   误判为免费会导致在非免费通道发送而真扣积分，因此这类短词只允许徽标全等匹配。
+FREE_MODEL_BADGE_EXACT = ("x0", "×0", "免", "0", "0 积分", "free", "免费", "限免")
+_POLICY_FREE_WINDOW = {"start": "23:00", "end": "08:00", "source": "policy"}
+
+
+def _parse_multiplier(text: str):
+    """从徽标/文本解析积分倍率，如 'x2' '倍率2' 'x0.5' '2倍'。返回 float 或 None。
+    必须带显式倍率标记(x/×/*/倍)或徽标本身就是一个数字，避免把模型名里的
+    数字(如 'Hy4')误判为倍率而错误触发"非免费"。"""
+    if not text:
+        return None
+    s = text.strip()
+    # 形式1：显式倍率标记 x/×/*/倍 后跟数字，如 x2 / ×0.5 / *2 / 倍率2 / 2倍
+    m = re.search(r"(?:[xX×*]|倍率?)\s*(\d+(?:\.\d+)?)\s*倍?", s)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    # 形式1b：数字后跟"倍"，如 2倍 / 0.5倍
+    m = re.search(r"(\d+(?:\.\d+)?)\s*倍", s)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    # 形式2：整个徽标就是一个数字（如 "0" "2" "0.5"），视为倍率
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        return float(s)
+    return None
+
+
+def _parse_window_from_text(text: str):
+    """从文本解析免费时段 HH:MM-HH:MM，返回 (start,end) 或 None。
+    兼容 '23:00-08:00' / '23:00 到 08:00' / '23:00-次日 8:00' 等写法。"""
+    if not text:
+        return None
+    m = re.search(r"(\d{1,2}):(\d{2})\s*[-~到至]\s*[\u4e00-\u9fff]{0,4}?\s*(\d{1,2}):(\d{2})", text)
+    if m:
+        return (f"{int(m.group(1)):02d}:{int(m.group(2)):02d}",
+                f"{int(m.group(3)):02d}:{int(m.group(4)):02d}")
+    return None
+
+
+def classify_model(item: dict):
+    """把一个 list_models() 返回的模型项归类为结构化记录。
+    返回 {name, free, free_confidence, free_reason, badge, multiplier, free_window, raw}。
+
+    准确率原则（宁可漏判绝不误判）：
+      - 正向信号：免费关键词 / 免费徽标 / 倍率为 0
+      - 负向信号：倍率>0 或 文本含正积分成本(如 "10积分") → 强制非免费
+    二者冲突时以负向信号为准，避免走积分通道真扣积分。"""
+    name = (item.get("name") or "").strip()
+    badge = (item.get("badge") or "").strip()
+    text = (item.get("text") or "").strip()
+    desc = (item.get("desc") or "").strip()
+    combined = f"{name} {badge} {text} {desc}"
+    multiplier = _parse_multiplier(badge) or _parse_multiplier(text)
+    # 负向信号：检测到积分成本（倍率>0，或形如 "10积分" 的正成本）
+    cost_m = re.search(r"(\d+(?:\.\d+)?)\s*积分", combined)
+    positive_cost = ((multiplier is not None and multiplier > 0)
+                     or (cost_m is not None and float(cost_m.group(1)) > 0))
+    # 正向信号
+    badge_norm = badge.strip().lower()
+    free_kw = any(re.search(p, combined, re.I) for p in FREE_PATTERNS)
+    free_badge = badge_norm in FREE_MODEL_BADGE_EXACT
+    zero_mult = (multiplier is not None and multiplier == 0)
+    reasons = []
+    if free_kw:
+        reasons.append("免费关键词")
+    if free_badge:
+        reasons.append("免费徽标")
+    if zero_mult:
+        reasons.append("倍率为0")
+    positive = free_kw or free_badge or zero_mult
+    if positive_cost:
+        positive = False
+        reasons = [f"检测到积分成本(倍率={multiplier}, 文本成本={cost_m.group(1) if cost_m else '?'}积分)→非免费"]
+    free = bool(positive)
+    free_window = _parse_window_from_text(text) or _parse_window_from_text(desc)
+    if free_window:
+        free_window = {"start": free_window[0], "end": free_window[1]}
+    return {
+        "name": name, "free": free,
+        "free_confidence": 1.0 if free else 0.0,
+        "free_reason": ("; ".join(reasons) if reasons else "非免费"),
+        "badge": badge, "multiplier": multiplier,
+        "free_window": free_window, "raw": combined[:140],
+    }
+
+
+def discover_free_models(cfg: dict, state: dict = None, force: bool = False):
+    """从 WorkBuddy 模型选择器（底层 DOM）枚举模型并标注免费状态。
+    结果写入 state['model_catalog']。返回目录列表或 None（CDP 不可用/未配置发现）。"""
+    auto = cfg.get("auto_send", {})
+    if not auto.get("discover_free_models", True) and not force:
+        return (state or {}).get("model_catalog")
+    try:
+        import workbuddy_cdp
+        raw = workbuddy_cdp.list_models()
+    except Exception as e:
+        log(f"发现免费模型失败(CDP): {e}")
+        return None
+    if not raw:
+        return None
+    cat = [classify_model(it) for it in raw if (it.get("name") or "").strip()]
+    if not cat:
+        return None
+    fresh = load_state()
+    fresh["model_catalog"] = cat
+    fresh.setdefault("free_info", {})["models_discovered_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_state(fresh)
+    if state is not None:
+        state["model_catalog"] = cat
+    n_free = sum(1 for c in cat if c["free"])
+    log(f"已发现 {len(cat)} 个模型，其中 {n_free} 个免费："
+        f"{[c['name'] for c in cat if c['free']]}")
+    return cat
+
+
+def _save_free_window(state: dict, win: dict):
+    fresh = load_state()
+    fi = fresh.setdefault("free_info", {})
+    fi["window"] = {"start": win["start"], "end": win["end"], "source": win.get("source", "config")}
+    if win.get("ctx"):
+        fi["window"]["ctx"] = win["ctx"]
+    fi["discovered_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_state(fresh)
+    if state is not None:
+        state.setdefault("free_info", {}).update(fi)
+
+
+def discover_free_window(cfg: dict, state: dict = None, force: bool = False):
+    """从 WorkBuddy 页面 DOM 发现全局免费时段（闲时夜间窗口）。
+    发现不到则回退到配置/策略默认 23:00-08:00。写入 state['free_info']['window']。"""
+    auto = cfg.get("auto_send", {})
+    w = auto.get("free_window", {})
+    fallback = {"start": str(w.get("start", "23:00")),
+                "end": str(w.get("end", "08:00")), "source": "config"}
+    if auto.get("discover_free_window", True) or force:
+        try:
+            import workbuddy_cdp
+            dom = workbuddy_cdp.discover_free_window_dom()
+            if dom:
+                win = {"start": dom["start"], "end": dom["end"],
+                       "source": "discovered", "ctx": dom.get("ctx", "")}
+                _save_free_window(state, win)
+                log(f"已从 WorkBuddy 页面发现免费时段: {win['start']}-{win['end']} (ctx={win.get('ctx')})")
+                return win
+        except Exception as e:
+            log(f"发现免费时段失败(CDP): {e}")
+    _save_free_window(state, fallback)
+    log(f"使用免费时段（配置/策略默认）: {fallback['start']}-{fallback['end']}")
+    return fallback
+
+
+def effective_free_window(state: dict, model: str = None) -> dict:
+    """返回用于判定的免费时段 {start, end, source}：
+    优先模型专属窗口(model_catalog) → 全局 free_info.window → 策略默认 23:00-08:00。"""
+    if model:
+        for m in (state or {}).get("model_catalog", []) or []:
+            if m.get("name") == model and m.get("free_window"):
+                return m["free_window"]
+    fi = (state or {}).get("free_info", {}) or {}
+    win = fi.get("window")
+    if win and win.get("start") and win.get("end"):
+        return {"start": win["start"], "end": win["end"], "source": win.get("source", "config")}
+    return dict(_POLICY_FREE_WINDOW)
+
+
+def in_window(win: dict, now=None) -> bool:
+    """win: {start, end} 支持跨午夜。未配置返回 True。"""
+    if not win:
+        return True
+    try:
+        sh, sm = map(int, str(win.get("start", "23:00")).split(":"))
+        eh, em = map(int, str(win.get("end", "08:00")).split(":"))
+    except (ValueError, AttributeError):
+        return True
+    now = now or datetime.now()
+    cur = now.hour * 60 + now.minute
+    s, e = sh * 60 + sm, eh * 60 + em
+    if s == e:
+        return True
+    if s < e:
+        return s <= cur < e
+    return cur >= s or cur < e  # 跨午夜窗口
+
+
+def is_model_free_now(model: str, state: dict, cfg: dict, now=None) -> bool:
+    """model 当前是否处于免费可用状态（已发现为免费 且 在免费时段内）。
+    无发现数据时回退原行为：全局免费时段内一律视为可免积分发送。"""
+    cat = (state or {}).get("model_catalog", []) or []
+    if cat:  # 有发现数据：只对标记为免费的模型在免费时段内放行
+        if not model:
+            return in_free_window(cfg, now, state)
+        m = next((x for x in cat if x.get("name") == model), None)
+        if m and m.get("free"):
+            return in_free_window(cfg, now, state, model)
+        return False  # 模型未标记为免费（或未发现该模型）：free_only 下禁止，避免扣积分
+    # 无发现数据：回退到原行为——全局免费时段内视为可免积分发送
+    return in_free_window(cfg, now, state)
+
+
+def task_sendable_now(task: dict, state: dict, cfg: dict, now=None) -> bool:
+    """判断一个 pending 任务此刻是否可以发送（free_only 前提下绝不消耗积分）。
+    满足以下任一即可发：① 限流重置时间已到 ② 处于免费模型的免费时段 ③ 已到用户指定时间。"""
+    now = now or datetime.now()
+    if balance_guard_paused(state):
+        return False
+    auto = cfg.get("auto_send", {})
+    free_only = auto.get("free_only", True)
+    # ① 显式定时：未到时间不发
+    sched = task.get("scheduled_time")
+    if sched:
+        try:
+            sched_dt = datetime.strptime(sched, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            sched_dt = None
+        if sched_dt and now < sched_dt:
+            return False
+    # ② 限流闸门：模型仍被限流且未到重置时间，不发
+    model = task.get("model")
+    rl = state.get("rate_limits", {})
+    if model and isinstance(rl, dict):
+        info = rl.get(model) or (rl.get("default") if model else None)
+        if isinstance(info, dict) and info.get("reset"):
+            try:
+                reset_dt = datetime.strptime(info["reset"], "%Y-%m-%d %H:%M:%S")
+                if now < reset_dt:
+                    return False
+            except ValueError:
+                pass
+    # ③ 免费额度保护：free_only 且任务未显式允许消耗积分时，必须处于免费状态
+    if free_only and not task.get("allow_credit"):
+        if not is_model_free_now(model, state, cfg, now):
+            return False
+    return True
+
 
 # ---------------------------------------------------------------------------
 # 任务队列
 # ---------------------------------------------------------------------------
-def add_task(state: dict, content: str, model: str = ""):
+def add_task(state: dict, content: str, model: str = "", scheduled_time: str = None,
+             allow_credit: bool = False):
     """添加任务。注意：始终从磁盘读最新状态再合并写回，
-    避免用调用方内存里的旧状态覆盖磁盘上其他线程/进程的更改。"""
+    避免用调用方内存里的旧状态覆盖磁盘上其他线程/进程的更改。
+
+    scheduled_time: "YYYY-MM-DD HH:MM:SS" 或 None（None=立即入队/等免费时段）
+    allow_credit:   是否允许在免费时段外消耗积分发送（默认 False，保护积分）
+    """
+    if scheduled_time:
+        try:
+            datetime.strptime(scheduled_time, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            scheduled_time = None  # 格式非法则退化为立即
     task = {
         "id": int(time.time() * 1000),
         "content": content,
         "model": model,
         "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "scheduled_time": scheduled_time,
+        "allow_credit": bool(allow_credit),
         "status": "pending",  # pending / sent / failed
     }
     fresh = load_state()
     fresh.setdefault("tasks", []).append(task)
     save_state(fresh)
     state["tasks"] = fresh["tasks"]  # 同步回调用方视图
-    log(f"已添加任务 #{task['id']}: {content[:50]}")
+    sched_hint = f" 定时={scheduled_time}" if scheduled_time else ""
+    log(f"已添加任务 #{task['id']}: {content[:50]}{sched_hint}")
     return task
 
 
@@ -212,6 +498,303 @@ def update_task(task_id, **fields):
 def pending_tasks(state: dict, model: str = ""):
     return [t for t in state.get("tasks", [])
             if t.get("status") == "pending" and (not model or t.get("model") == model)]
+
+# ---------------------------------------------------------------------------
+# 自动迭代引擎
+# ---------------------------------------------------------------------------
+# 用户定义一个"迭代目标"，引擎在免费时段内自动执行任务；
+# 每次完成后根据"当前状态"（上次 WorkBuddy 回复 + 错误检测）智能生成下一步优化提示词，
+# 再次入队、再次执行，如此反复，且只在免费时段推进。可设最大轮数（0=无限）。
+ITER_STRATEGIES = ("staged", "improve", "reflect")
+_IMPROVE_ANGLES = [
+    "实现项目核心功能，产出可运行的第一版",
+    "检查并修复潜在错误、异常与边界情况",
+    "提升代码质量与可读性（命名、结构、注释）",
+    "补充单元测试与关键场景覆盖",
+    "优化性能与资源占用",
+    "完善文档与使用说明",
+    "做一轮整体回顾，打磨收尾并验证目标达成",
+]
+_FAIL_KW = ("错误", "报错", "失败", "异常", "traceback", "error", "exception",
+            "✗", "✘", "cannot", "undefined", "syntax", "failed", "unable")
+
+
+def _looks_failed(text):
+    if not text:
+        return False
+    low = (text or "").lower()
+    return any(k in low for k in _FAIL_KW)
+
+
+def _truncate(s, n=800):
+    s = (s or "").strip()
+    return s[:n] + ("…" if len(s) > n else "")
+
+
+def ensure_campaigns(state):
+    state.setdefault("campaigns", [])
+    for c in state["campaigns"]:
+        c.setdefault("history", [])
+        c.setdefault("stage_index", 0)
+        c.setdefault("current_iteration", 0)
+        c.setdefault("error_count", 0)
+        c.setdefault("awaiting_result", False)
+        c.setdefault("last_task_id", None)
+        c.setdefault("last_prompt", "")
+        c.setdefault("last_result", "")
+        c.setdefault("stages", [])
+    return state["campaigns"]
+
+
+def active_campaigns(state):
+    return [c for c in ensure_campaigns(state) if c.get("status") == "running"]
+
+
+def pick_free_model(state):
+    """从已发现目录里挑一个免费模型；没有返回 None。"""
+    cat = (state or {}).get("model_catalog") or []
+    free = [c["name"] for c in cat if c.get("free")]
+    return free[0] if free else None
+
+
+def create_campaign(state, goal, strategy="improve", model="", stages=None,
+                    max_iterations=0, repo_path="", test_cmd=""):
+    """创建自动迭代活动。返回新 campaign dict。
+    repo_path/test_cmd 用于"代码自迭代"：活动会生成携带读文件/改文件/跑测试
+    指令的提示词，让接收方 WorkBuddy 真正改动项目并产生可验证的 diff。"""
+    strategy = strategy if strategy in ITER_STRATEGIES else "improve"
+    camps = ensure_campaigns(state)
+    camp = {
+        "id": int(time.time() * 1000),
+        "goal": goal.strip(),
+        "strategy": strategy,
+        "model": (model or "").strip(),
+        "stages": [s.strip() for s in (stages or []) if s.strip()],
+        "max_iterations": int(max_iterations or 0),
+        "repo_path": (repo_path or "").strip(),
+        "test_cmd": (test_cmd or "").strip(),
+        "current_iteration": 0,
+        "stage_index": 0,
+        "status": "running",
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_prompt": "",
+        "last_result": "",
+        "last_task_id": None,
+        "awaiting_result": False,
+        "error_count": 0,
+        "stagnation": False,
+        "history": [],
+    }
+    camps.append(camp)
+    save_state(state)
+    log(f"已创建迭代活动 #{camp['id']} 目标={goal[:40]} 策略={strategy} "
+        f"最大轮数={'∞' if not camp['max_iterations'] else camp['max_iterations']}")
+    return camp
+
+
+def campaign_by_id(state, cid):
+    for c in ensure_campaigns(state):
+        if c["id"] == cid:
+            return c
+    return None
+
+
+def set_campaign_status(state, cid, status):
+    c = campaign_by_id(state, cid)
+    if c:
+        c["status"] = status
+        if status == "running":
+            # 恢复时清空在途状态，下一轮重新生成任务
+            c["awaiting_result"] = False
+            c["last_task_id"] = None
+        save_state(state)
+        log(f"迭代活动 #{cid} 状态 -> {status}")
+        return True
+    return False
+
+
+def _effective_model(camp, state):
+    """选择本次迭代使用的免费模型：优先活动指定且确实免费的模型，否则自动挑免费模型，再退化为活动指定/空。"""
+    pref = (camp.get("model") or "").strip()
+    free = pick_free_model(state)
+    cat = (state or {}).get("model_catalog") or []
+    if pref and any(c["name"] == pref and c.get("free") for c in cat):
+        return pref
+    if free:
+        return free
+    return pref or ""
+
+
+def _similar(a, b, threshold=0.9):
+    """两段文本相似度（difflib ratio），用于停滞检测。"""
+    import difflib
+    return difflib.SequenceMatcher(None, a or "", b or "").ratio() >= threshold
+
+
+def generate_next_prompt(camp, state):
+    """根据当前状态生成下一步优化提示词。返回 (prompt, label) 或 None（活动应结束）。"""
+    it = camp["current_iteration"] + 1  # 本轮是第几轮
+    last = camp.get("last_result", "")
+    failed = _looks_failed(last)
+    goal = camp.get("goal", "")
+    ctx = f"项目目标：{goal}\n" if goal else ""
+    base = (f"{ctx}这是第 {it} 轮自主迭代。请直接动手改进并给出结果"
+            f"（纯文本/代码，不要触发消耗积分的多模态功能）。\n")
+    if failed:
+        base += (f"⚠ 上一步执行似乎出现了问题，请先定位并修复，再继续推进。\n"
+                 f"上一步产出（节选）：\n{_truncate(last, 600)}\n")
+    else:
+        base += f"上一轮产出摘要（节选）供参考：\n{_truncate(last, 600)}\n"
+
+    strat = camp.get("strategy", "improve")
+    if strat == "staged":
+        stages = camp.get("stages") or []
+        if not stages:
+            stages = _IMPROVE_ANGLES
+        idx = camp["stage_index"] % len(stages)
+        label = stages[idx]
+        prompt = f"{base}\n本轮阶段任务（{label}）：\n{label}"
+        return _apply_code_tail(prompt, camp, label), label
+    if strat == "reflect":
+        label = "模型自主反思优化"
+        prompt = (f"{base}\n请审视你上一轮的产出与当前项目状态，自己决定当前最有价值的"
+                  f"一个改进点，并直接实施它。只做最关键的一件事，做到位即可。")
+        return _apply_code_tail(prompt, camp, label), label
+    # improve（默认）
+    angle = _IMPROVE_ANGLES[min(it - 1, len(_IMPROVE_ANGLES) - 1)]
+    label = angle
+    prompt = f"{base}\n本轮优化方向：{angle}\n请围绕该方向改进当前项目。"
+    return _apply_code_tail(prompt, camp, label), label
+
+
+def _apply_code_tail(prompt, camp, label):
+    """若活动指向代码仓库，附加'读文件→改文件→跑测试→汇报'指令，使自迭代产生真实改动。"""
+    repo = camp.get("repo_path")
+    if not repo:
+        return prompt
+    test_cmd = camp.get("test_cmd") or "python -m py_compile *.py && echo OK"
+    tail = (
+        f"\n\n—— 执行要求（代码自迭代）——\n"
+        f"本项目位于目录：{repo}\n"
+        f"请按以上方向（{label}）真正改进代码，不要只给建议：\n"
+        f"1) 先用工具读取相关源文件，理解现状；\n"
+        f"2) 直接修改对应文件（新增/修复/重构），确保改动可运行、不破坏现有功能；\n"
+        f"3) 运行验证命令确认无回归：\n    {test_cmd}\n"
+        f"4) 简短汇报：改了哪些文件、改了什么、验证结果（通过/失败）。\n"
+        f"只做与本轮方向相关的一件关键改动，做到位即可。"
+    )
+    return prompt + tail
+
+
+def advance_campaign(camp, result, state):
+    """收到一次迭代结果后推进：记录历史、轮次+1、错误计数、停止条件判定。"""
+    camp["current_iteration"] += 1
+    camp["history"].append({
+        "iter": camp["current_iteration"],
+        "prompt": camp.get("last_prompt", ""),
+        "result": _truncate(result, 600),
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    camp["last_result"] = result or camp.get("last_result", "")
+    stages = camp.get("stages") or _IMPROVE_ANGLES
+    camp["stage_index"] = (camp["stage_index"] + 1) % max(1, len(stages))
+    camp["awaiting_result"] = False
+    camp["last_task_id"] = None
+    if _looks_failed(result):
+        camp["error_count"] = camp.get("error_count", 0) + 1
+    else:
+        camp["error_count"] = 0
+    # 停止条件
+    if camp["max_iterations"] and camp["current_iteration"] >= camp["max_iterations"]:
+        camp["status"] = "done"
+        log(f"迭代活动 #{camp['id']} 达到最大轮数 {camp['max_iterations']}，已结束")
+    elif camp["error_count"] >= 3:
+        camp["status"] = "paused"
+        log(f"迭代活动 #{camp['id']} 连续 3 轮检测到失败，已自动暂停（请检查后恢复）")
+    else:
+        # 停滞检测：连续 2 轮结果几乎相同（无进展）则暂停，避免无限空转烧免费额度
+        hist = camp.get("history", [])
+        if len(hist) >= 2:
+            prev = hist[-2].get("result", "") or ""
+            cur = hist[-1].get("result", "") or ""
+            if prev and cur and _similar(prev, cur):
+                camp["status"] = "paused"
+                camp["stagnation"] = True
+                log(f"迭代活动 #{camp['id']} 连续 2 轮输出几乎相同，已自动暂停"
+                    f"（疑似无进展，请检查目标任务是否仍可优化）")
+    save_state(state)
+
+
+def ensure_campaign_task(camp, state, cfg, now):
+    """若活动没有待发送任务，则生成下一步提示词并入队。返回 pending 任务或 None（活动结束）。"""
+    pending = [t for t in state.get("tasks", [])
+               if t.get("campaign_id") == camp["id"] and t.get("status") == "pending"]
+    if pending:
+        return pending[0]
+    prompt, label = generate_next_prompt(camp, state)
+    if prompt is None:
+        camp["status"] = "done"
+        save_state(state)
+        return None
+    model = _effective_model(camp, state)
+    # 免费额度保护：迭代任务绝不消耗积分（allow_credit=False），只在免费时段/免费模型发送
+    task = add_task(state, prompt, model=model, scheduled_time=None, allow_credit=False)
+    # 必须同步更新内存里的任务对象：add_task 返回的对象就在 state["tasks"] 中，
+    # 若只调用 update_task 落盘，随后 save_state(state) 会用内存中的旧副本覆盖掉
+    # campaign_id，导致下一轮查不到在途任务而重复入队、无限堆积任务。
+    task["campaign_id"] = camp["id"]
+    task["model"] = model
+    update_task(task["id"], campaign_id=camp["id"], model=model)
+    camp["last_prompt"] = prompt
+    camp["awaiting_result"] = True
+    camp["last_task_id"] = task["id"]
+    save_state(state)
+    log(f"迭代活动 #{camp['id']} 已生成第 {camp['current_iteration'] + 1} 轮任务"
+        f"（方向：{label}）模型={model or '自动(免费时段)'}")
+    return task
+
+
+def try_capture_campaign_result(camp, cfg, timeout=240, poll=15):
+    """尝试读取 WorkBuddy 对 camp.last_task_id 的回复。返回文本或 None（未就绪/超时/不可用）。"""
+    try:
+        import workbuddy_cdp
+        msg = workbuddy_cdp.last_assistant_message(timeout=timeout, poll=poll)
+        if msg:
+            return msg
+    except Exception as e:
+        log(f"迭代读取 WorkBuddy 回复失败(可忽略): {e}")
+    return None
+
+
+def run_iteration_step(state, cfg, now=None):
+    """执行一轮自动迭代步进。调用方需保证当前处于免费时段（免费额度保护前提）。
+    已发送任务会在此阻塞等待 WorkBuddy 回复（最长 timeout 秒，轮询），拿到结果后立即
+    生成下一轮任务——这样在一个免费时段内可连续多轮迭代。"""
+    now = now or datetime.now()
+    for camp in active_campaigns(state):
+        # 1) 若已发送任务在等回复，尝试捕获结果
+        if camp.get("awaiting_result") and camp.get("last_task_id"):
+            t = next((x for x in state.get("tasks", [])
+                      if x.get("id") == camp["last_task_id"]), None)
+            if not t:
+                camp["awaiting_result"] = False
+                camp["last_task_id"] = None
+                save_state(state)
+            elif t.get("status") == "sent":
+                res = try_capture_campaign_result(camp, cfg)
+                if res is not None:
+                    advance_campaign(camp, res, state)
+                    # 成功推进后，若活动仍活跃，立即生成下一轮任务（同一轮内连续迭代）
+                    if camp.get("status") == "running":
+                        ensure_campaign_task(camp, state, cfg, now)
+                # 未捕获到（CDP 不可用或仍在流式输出）则保持 awaiting，下轮继续
+                continue
+            else:
+                # 仍在 pending：等统一调度循环发送
+                continue
+        # 2) 需要下一轮任务
+        ensure_campaign_task(camp, state, cfg, now)
+
 
 # ---------------------------------------------------------------------------
 # 发送
@@ -360,6 +943,11 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy") -> tup
 
 def send_task(task: dict, cfg: dict):
     mode = cfg.get("send_mode", "notify")
+    state = load_state()  # 发送前取最新状态（含 model_catalog / free_info）
+    # 这两个变量在函数末尾的余额守卫中无条件引用，必须在此初始化，
+    # 否则 command / api 模式会因未定义而抛 NameError，导致任务状态永远标不上 sent。
+    auto = cfg.get("auto_send", {})
+    balance_before = None  # 发送前余额基线（仅 notify 模式实际读取）
     log(f"发送任务 #{task['id']}: {task['content'][:50]} (mode={mode})")
     if mode == "command":
         cmd = cfg.get("send_command", "")
@@ -378,14 +966,16 @@ def send_task(task: dict, cfg: dict):
             with urllib.request.urlopen(req, timeout=30) as resp:
                 log(f"API 响应: {resp.status}")
     else:
-        auto = cfg.get("auto_send", {})
         if auto.get("enabled") and auto.get("free_only", True):
-            # 免费时段检查：不在 23:00-08:00 内不发送，任务保留排队
-            if not in_free_window(cfg):
-                log(f"任务 #{task['id']} 等待免费时段(23:00-08:00)，暂不发送")
-                return
+            # 免费额度保护：除非任务显式允许消耗积分，否则必须处于免费状态
+            if not task.get("allow_credit"):
+                now = datetime.now()
+                if not is_model_free_now(task.get("model", ""), state, cfg, now):
+                    win = effective_free_window(state, task.get("model", ""))
+                    log(f"任务 #{task['id']} 当前非免费时段/非免费模型"
+                        f"（窗口 {win['start']}-{win['end']}），暂不发送")
+                    return
             # 余额守卫：发送前读余额作为基线
-            balance_before = None
             if auto.get("balance_guard", True):
                 balance_before = read_balance(cfg)
                 if balance_before is not None:
@@ -542,32 +1132,30 @@ def read_balance(cfg: dict):
 _BALANCE_STATE_KEY = "balance_guard"
 
 
-def in_free_window(cfg: dict, now=None) -> bool:
+def in_free_window(cfg: dict, now=None, state=None, model=None) -> bool:
     """判断当前时间是否在免费时段内（支持跨午夜，如 23:00-08:00）。
+    state/model 提供时优先用发现到的专属窗口；否则用配置窗口。
     未配置时默认启用 23:00-08:00。"""
-    w = cfg.get("auto_send", {}).get("free_window", {})
+    auto = cfg.get("auto_send", {})
+    w = auto.get("free_window", {})
     if w.get("enabled", True) is False:
         return True  # 用户明确关闭了时段限制
-    try:
-        sh, sm = map(int, str(w.get("start", "23:00")).split(":"))
-        eh, em = map(int, str(w.get("end", "08:00")).split(":"))
-    except (ValueError, AttributeError):
-        return True
-    now = now or datetime.now()
-    cur = now.hour * 60 + now.minute
-    s, e = sh * 60 + sm, eh * 60 + em
-    if s == e:
-        return True  # 全天
-    if s < e:
-        return s <= cur < e
-    return cur >= s or cur < e  # 跨午夜窗口
+    win = effective_free_window(state or {}, model) if (state is not None or model) else None
+    if win:
+        return in_window(win, now)
+    # 无 state 时退回配置窗口
+    return in_window({"start": str(w.get("start", "23:00")),
+                      "end": str(w.get("end", "08:00"))}, now)
 
 
-def next_free_window(cfg: dict, now=None):
-    """返回下一个免费时段开始的 datetime（用于倒计时显示）"""
-    w = cfg.get("auto_send", {}).get("free_window", {})
+def next_free_window(cfg: dict, state=None, now=None):
+    """返回下一个免费时段开始的 datetime（用于倒计时显示）。"""
+    if state is not None:
+        win = effective_free_window(state, None)
+    else:
+        win = {"start": str(cfg.get("auto_send", {}).get("free_window", {}).get("start", "23:00"))}
     try:
-        sh, sm = map(int, str(w.get("start", "23:00")).split(":"))
+        sh, sm = map(int, str(win.get("start", "23:00")).split(":"))
     except (ValueError, AttributeError):
         return None
     now = now or datetime.now()
@@ -621,6 +1209,12 @@ def verify_no_credit_charge(cfg: dict, before: float, task_id) -> bool:
 def run_loop(cfg: dict, once: bool = False):
     interval = max(5, int(cfg.get("poll_interval", 30)))
     log(f"开始监控 (interval={interval}s, mode={cfg.get('send_mode')})")
+    # 启动时尝试从 WorkBuddy 底层发现免费模型与免费时段（失败仅记录，不影响后续）
+    try:
+        discover_free_models(cfg, None)
+        discover_free_window(cfg, None)
+    except Exception as e:
+        log(f"初始免费发现失败(可忽略): {e}")
     while True:
         try:
             # 每轮从磁盘读最新状态，避免长期持有旧视图覆盖别人的写入
@@ -628,33 +1222,46 @@ def run_loop(cfg: dict, once: bool = False):
             check_rate_limits(state, cfg)
 
             now = datetime.now()
-            # 检查限流模型的重置时间，到点则发送该模型的待发任务
-            rl = state.get("rate_limits", {})
-            if not isinstance(rl, dict):
-                rl = {}
-                state["rate_limits"] = {}
-            for key, info in list(rl.items()):
-                reset_str = info.get("reset", "")
-                if not reset_str:
-                    continue
-                try:
-                    reset = datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    log(f"限流记录 {key} 的时间戳无效: {reset_str}，跳过")
-                    continue
-                if now >= reset:
-                    model = info.get("model", key)
-                    tasks = pending_tasks(state, model=model)
-                    if not tasks:
-                        # 免费额度保护：只发指定模型的任务，
-                        # 防止把别的模型(可能仍被限流，走积分)的任务误发
-                        tasks = []
-                    for t in tasks:
+            # 余额守卫暂停中：跳过自动发送，但仍更新限流检测
+            if balance_guard_paused(state):
+                if once:
+                    break
+                time.sleep(interval)
+                continue
+
+            # 统一调度：遍历所有 pending 任务，到达发送条件即发送。
+            # 条件由 task_sendable_now 判定：
+            #   ① 限流重置时间已到   ② 免费模型处于免费时段   ③ 用户指定时间已到
+            for t in pending_tasks(state):
+                if task_sendable_now(t, state, cfg, now):
+                    # 发送前二次确认仍是 pending（可能被其他进程/线程发送）
+                    still = next((x for x in load_state().get("tasks", [])
+                                  if x.get("id") == t.get("id") and x.get("status") == "pending"), None)
+                    if still:
                         send_task(t, cfg)
-                    if tasks:
-                        # 发完即清除限流记录
-                        state["rate_limits"].pop(key, None)
-                        save_state(state)
+
+            # 自动迭代：仅在免费时段内推进（免费额度保护的前提）
+            if in_free_window(cfg, now, state):
+                run_iteration_step(state, cfg, now)
+
+            # 清理已过重置且无待发任务的限流记录（避免无限堆积）
+            state = load_state()
+            rl = state.get("rate_limits", {})
+            if isinstance(rl, dict):
+                changed = False
+                for key, info in list(rl.items()):
+                    reset_str = info.get("reset", "")
+                    if not reset_str:
+                        continue
+                    try:
+                        reset = datetime.strptime(reset_str, "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        continue
+                    if now >= reset and not pending_tasks(state, model=info.get("model", key)):
+                        rl.pop(key, None)
+                        changed = True
+                if changed:
+                    save_state(state)
 
             # 查询余额（可选）
             bal, usage = balance_check(cfg)
@@ -678,8 +1285,29 @@ def main():
     p = argparse.ArgumentParser(description="WorkBuddy 用量/余额监控")
     p.add_argument("--add", metavar="TEXT", help="添加任务")
     p.add_argument("--model", default="", help="任务关联的模型（可选）")
+    p.add_argument("--at", metavar="TIME", default=None,
+                   help="定时发送时间: 'YYYY-MM-DD HH:MM:SS' 或 'free'(下一免费时段)。空=立即入队/等免费时段")
+    p.add_argument("--allow-credit", action="store_true",
+                   help="允许在免费时段外消耗积分发送（谨慎，默认保护积分不消耗）")
     p.add_argument("--list", action="store_true", help="列出任务")
     p.add_argument("--status", action="store_true", help="查看限流状态")
+    p.add_argument("--catalog", action="store_true", help="打印已发现的免费模型目录")
+    p.add_argument("--discover", action="store_true", help="从 WorkBuddy 底层发现免费模型/时段并打印")
+    # 自动迭代：在免费时段内反复执行任务，每轮根据上轮结果智能生成下一步优化提示词
+    p.add_argument("--iterate", metavar="GOAL", help="开启自动迭代：填入目标/初始提示词")
+    p.add_argument("--strategy", choices=ITER_STRATEGIES, default="improve",
+                   help="迭代策略: staged(自定义阶段循环)/improve(内置渐进优化)/reflect(模型自主反思)")
+    p.add_argument("--stages", metavar="A,B,C", default="", help="staged 策略的阶段列表（逗号分隔）")
+    p.add_argument("--repo", metavar="PATH", default="",
+                   help="代码自迭代：目标项目目录；指定后提示词会携带'读文件/改文件/跑测试'指令")
+    p.add_argument("--test-cmd", metavar="CMD", default="",
+                   help="代码自迭代：每次改动后运行的验证命令（默认 py_compile *.py）")
+    p.add_argument("--max", type=int, default=0, metavar="N",
+                   help="最大迭代轮数（0=无限，仅在免费时段内推进）")
+    p.add_argument("--list-iter", action="store_true", help="列出自动迭代活动")
+    p.add_argument("--stop-iter", type=int, metavar="ID", help="停止指定迭代活动")
+    p.add_argument("--pause-iter", type=int, metavar="ID", help="暂停指定迭代活动")
+    p.add_argument("--resume-iter", type=int, metavar="ID", help="恢复指定迭代活动")
     p.add_argument("--clear", action="store_true", help="清空已发送任务")
     p.add_argument("--parse", metavar="TEXT", help="解析一条限流消息（测试）")
     p.add_argument("--once", action="store_true", help="单次检查后退出")
@@ -692,9 +1320,47 @@ def main():
         print(f"解析成功: {ok}\n模型: {model}\n重置时间: {reset}")
         return
 
+    if args.discover:
+        state = load_state()
+        cat = discover_free_models(cfg, state, force=True)
+        win = discover_free_window(cfg, state, force=True)
+        if cat is None:
+            print("（无法从 WorkBuddy 底层发现模型：WorkBuddy 未运行或 CDP 不可用）")
+        else:
+            print(f"已发现 {len(cat)} 个模型：")
+            for c in cat:
+                tag = "免费" if c["free"] else "积分"
+                fw = c.get("free_window")
+                extra = f" 时段{fw['start']}-{fw['end']}" if fw else ""
+                print(f"  - {c['name']}  [{tag}]  badge={c['badge'] or '-'}{extra}")
+        print(f"免费时段: {win['start']}-{win['end']} (来源: {win.get('source')})")
+        return
+
+    if args.catalog:
+        state = load_state()
+        cat = state.get("model_catalog") or []
+        if not cat:
+            print("(尚无模型目录，先运行 --discover 或启动监控自动发现)")
+        else:
+            for c in cat:
+                print(f"  - {c['name']}  {'免费' if c['free'] else '积分'}  badge={c['badge'] or '-'}")
+        return
+
     if args.add:
         state = load_state()
-        add_task(state, args.add, args.model)
+        sched = None
+        if args.at:
+            if args.at.strip().lower() == "free":
+                nxt = next_free_window(cfg, state)
+                sched = nxt.strftime("%Y-%m-%d %H:%M:%S") if nxt else None
+            else:
+                sched = args.at.strip()
+        add_task(state, args.add, args.model, scheduled_time=sched,
+                 allow_credit=args.allow_credit)
+        if sched:
+            print(f"已添加定时任务，将于 {sched} 发送")
+        else:
+            print("已添加任务（立即/等免费时段）")
         return
 
     if args.list:
@@ -704,7 +1370,10 @@ def main():
             print("(队列为空)")
         for t in tasks:
             mark = "[done]" if t["status"] == "sent" else "[wait]"
-            print(f"{mark} #{t['id']} [{t['status']}] model={t.get('model','-')} {t['content']}")
+            sched = t.get("scheduled_time") or "-"
+            credit = " [允许积分]" if t.get("allow_credit") else ""
+            print(f"{mark} #{t['id']} [{t['status']}] model={t.get('model','-')} "
+                  f"定时={sched}{credit} {t['content']}")
         return
 
     if args.status:
@@ -716,6 +1385,9 @@ def main():
             rl = {}
         for k, v in rl.items():
             print(f"{k}: model={v.get('model')} reset={v.get('reset')}")
+        fi = state.get("free_info", {}).get("window")
+        if fi:
+            print(f"免费时段: {fi.get('start')}-{fi.get('end')} (来源: {fi.get('source')})")
         return
 
     if args.clear:
@@ -723,6 +1395,47 @@ def main():
         state["tasks"] = [t for t in state.get("tasks", []) if t["status"] != "sent"]
         save_state(state)
         print("已清理已发送任务")
+        return
+
+    if args.list_iter:
+        state = load_state()
+        camps = ensure_campaigns(state)
+        if not camps:
+            print("(无迭代活动，用 --iterate \"目标\" 创建)")
+        for c in camps:
+            maxs = "∞" if not c.get("max_iterations") else c["max_iterations"]
+            print(f"#{c['id']} [{c['status']}] 轮次={c['current_iteration']}/{maxs} "
+                  f"策略={c['strategy']} 模型={c.get('model') or '自动'}")
+            print(f"   目标: {c.get('goal', '')[:60]}")
+            if c.get("last_result"):
+                print(f"   最近产出: {_truncate(c['last_result'], 80)}")
+        return
+
+    if args.stop_iter is not None:
+        ok = set_campaign_status(load_state(), args.stop_iter, "done")
+        print("已停止" if ok else "未找到该活动")
+        return
+    if args.pause_iter is not None:
+        ok = set_campaign_status(load_state(), args.pause_iter, "paused")
+        print("已暂停" if ok else "未找到该活动")
+        return
+    if args.resume_iter is not None:
+        ok = set_campaign_status(load_state(), args.resume_iter, "running")
+        print("已恢复" if ok else "未找到该活动")
+        return
+
+    if args.iterate:
+        state = load_state()
+        stages = [s for s in args.stages.split(",")] if args.stages else None
+        camp = create_campaign(state, args.iterate, strategy=args.strategy,
+                               model=args.model, stages=stages,
+                               max_iterations=args.max,
+                               repo_path=args.repo, test_cmd=args.test_cmd)
+        print(f"已创建迭代活动 #{camp['id']}，目标={args.iterate!r}")
+        print(f"策略={args.strategy} 最大轮数={'∞' if not args.max else args.max}")
+        if camp.get("repo_path"):
+            print(f"代码自迭代目录: {camp['repo_path']}  验证命令: {camp['test_cmd'] or '(默认 py_compile)'}")
+        print("启动监控（python workbuddy_monitor.py 或界面点启动监控）后，将在免费时段内自动迭代。")
         return
 
     run_loop(cfg, once=args.once)

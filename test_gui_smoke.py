@@ -1,0 +1,141 @@
+# -*- coding: utf-8 -*-
+"""workbuddy-monitor GUI 构建冒烟测试
+
+验证界面能完整构建、定时框能填充下一免费时段、任务能入队并渲染到表格、
+迭代管理窗口能打开且顶部能显示迭代状态。
+
+需要一个带 tkinter 的 Python（受管 Python 3.13 通常没有，用系统 Python 运行）：
+    python test_gui_smoke.py
+"""
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+try:
+    import tkinter as tk
+    from tkinter import ttk
+except Exception as e:  # noqa: BLE001
+    print(f"跳过：当前 Python 无 tkinter（{e}）。请用带 tkinter 的 Python 运行。")
+    sys.exit(0)
+
+import workbuddy_monitor as core  # noqa: E402
+
+# 隔离状态/配置到临时目录，避免污染仓库
+_TMP = Path(tempfile.mkdtemp(prefix="wbmon_gui_"))
+core.STATE_FILE = _TMP / "state.json"
+core.CONFIG_FILE = _TMP / "config.json"
+core.LOG_FILE = _TMP / "monitor.log"
+
+import workbuddy_gui as gui  # noqa: E402
+
+PASS = FAIL = 0
+FAILED = []
+
+
+def check(name, cond, detail=""):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"  \u2713 {name}")
+    else:
+        FAIL += 1
+        FAILED.append(name)
+        print(f"  \u2717 {name}   {detail}")
+
+
+print("== GUI 构建冒烟 ==")
+root = tk.Tk()
+root.withdraw()  # 不实际显示窗口
+
+app = gui.App(root)
+check("App 构建成功", app is not None)
+check("顶部免费信息标签存在", hasattr(app, "lbl_free"))
+check("顶部迭代状态标签存在", hasattr(app, "lbl_iter"))
+check("定时输入框存在", hasattr(app, "ent_schedule"))
+
+# 整体刷新（限流 / 免费信息 / 迭代状态 / 任务表）
+try:
+    app.refresh_all()
+    ok = True
+    err = ""
+except Exception as e:  # noqa: BLE001
+    ok, err = False, f"{type(e).__name__}: {e}"
+check("refresh_all 无异常（含新增的免费/迭代刷新）", ok, err)
+
+# 🌙 填充下一免费时段
+app.ent_schedule.delete(0, "end")
+app.on_fill_free_window()
+filled = app.ent_schedule.get().strip()
+check("🌙 填充下一免费时段成功", len(filled) == 19 and filled[4] == "-", f"实际='{filled}'")
+try:
+    from datetime import datetime
+    datetime.strptime(filled, "%Y-%m-%d %H:%M:%S")
+    ok = True
+except Exception:  # noqa: BLE001
+    ok = False
+check("填充值是合法时间格式", ok)
+
+# 添加一个定时任务并确认渲染进表格
+app.ent_task.delete(0, "end")
+app.ent_task.insert(0, "冒烟测试任务")
+app.ent_schedule.delete(0, "end")
+app.ent_schedule.insert(0, filled)
+app.on_add()
+st = core.load_state()
+check("任务已写入磁盘", any(t["content"] == "冒烟测试任务" for t in st["tasks"]))
+check("定时字段随任务保存",
+      any(t.get("scheduled_time") == filled for t in st["tasks"]))
+check("表格有渲染行", len(app.tree.get_children()) == 1,
+      f"实际={len(app.tree.get_children())}")
+check("表格含'定时'列", "scheduled" in app.tree["columns"], f"实际={app.tree['columns']}")
+
+# 迭代状态展示
+camp = core.create_campaign(core.load_state(), "冒烟迭代目标", strategy="improve")
+app.state = core.load_state()
+try:
+    app.refresh_iter()
+    ok = True
+    err = ""
+except Exception as e:  # noqa: BLE001
+    ok, err = False, f"{type(e).__name__}: {e}"
+check("refresh_iter 无异常", ok, err)
+check("迭代状态标签已更新", "迭代" in (app.lbl_iter.cget("text") or ""),
+      f"实际='{app.lbl_iter.cget('text')}'")
+
+# 打开迭代管理窗口（构建即验证，不进入事件循环）
+try:
+    app.on_iter_manage()
+    dialogs = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+    ok = len(dialogs) >= 1
+    err = f"子窗口数={len(dialogs)}"
+    for d in dialogs:
+        d.destroy()
+except Exception as e:  # noqa: BLE001
+    ok, err = False, f"{type(e).__name__}: {e}"
+check("迭代管理窗口能打开且构建无异常", ok, err)
+
+# 设置窗口（含新增的发现开关）
+try:
+    app.on_settings()
+    dialogs = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+    ok = len(dialogs) >= 1
+    err = f"子窗口数={len(dialogs)}"
+    for d in dialogs:
+        d.destroy()
+except Exception as e:  # noqa: BLE001
+    ok, err = False, f"{type(e).__name__}: {e}"
+check("设置窗口能打开且构建无异常", ok, err)
+
+root.destroy()
+
+print("\n" + "=" * 56)
+print(f"结果：通过 {PASS} / 失败 {FAIL}")
+if FAILED:
+    print("失败用例：")
+    for n in FAILED:
+        print(f"  - {n}")
+print("=" * 56)
+sys.exit(1 if FAIL else 0)
