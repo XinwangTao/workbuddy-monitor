@@ -1285,6 +1285,25 @@ check("兜底方向自带验收与汇报要求",
       "跑通" in _fb and "汇报" in _fb and "通过" in _fb, f"实际={_fb!r}")
 check("兜底方向是祈使句（可执行而非描述）", _fb.rstrip().endswith(("。", "）", ")")))
 
+# 端到端：兜底方向要经 generate_next_prompt 首轮分支真正下发到模型，
+# 且 _apply_code_tail 会把「方向」点名进执行要求里。旧版只在 log 里好看，
+# 下发正文的方向仍是空话——这里把它钉死在"最终发给模型的那段文本"上。
+_ap_c = core.create_campaign(core.load_state(), "兜底方向端到端", strategy="autopilot",
+                             model="FreeA", max_iterations=0,
+                             repo_path=str(HERE), test_cmd="python test_core.py")
+_ap_c["next_step"] = ""
+_p_c, _l_c = core.generate_next_prompt(_ap_c, core.load_state())
+# label 是给日志/展示用的来源标记（首轮=模型自主决策），方向文本本身走
+# _apply_code_tail 进正文；两者别混——之前误把 label 当成方向正文才写的错断言。
+check("首轮无方向→label 标为自主决策", "自主决策" in _l_c, f"label={_l_c!r}")
+check("兜底方向点名进下发正文的执行要求",
+      f"请按以上方向（{core.NEXT_STEP_FALLBACK}）" in _p_c,
+      f"正文尾段缺方向尾注: {_p_c[-160:]!r}")
+check("下发正文里不再是旧空话（最明显/不足之处/针对上轮）",
+      all(k not in _p_c for k in ("最明显", "不足之处", "针对上轮")))
+check("下发正文是代码自迭代口径（含目录与验证命令）",
+      "执行要求（代码自迭代）" in _p_c and str(HERE) in _p_c and "test_core.py" in _p_c)
+
 # 已有方向时，漏写标记不该把原有方向冲掉
 _ap_b = core.create_campaign(core.load_state(), "降级路径2", strategy="autopilot",
                              model="FreeA", max_iterations=0)
