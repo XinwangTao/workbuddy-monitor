@@ -12,3 +12,5 @@ campaign_reply.txt
 state.json.bak
 night_run.log
 reply_cache/
+.hb_demo.py
+.patch_heartbeat.py
