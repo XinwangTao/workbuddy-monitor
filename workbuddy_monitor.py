@@ -332,14 +332,15 @@ def log_heartbeat(state: dict, cfg: dict, now=None):
     if paused:
         tag = "被拦(余额守卫)"
         verdict = "被余额守卫拦住了，不推任务"
-    elif not active and not pend:
-        # 窗口内但无事可做：这叫空转，不能写成"待机守夜"——
-        # 守夜是窗口外的正常状态，混在一起就分不出"它在岗"和"它没活干"
-        tag = "空转"
-        verdict = "窗口开着，但没活可推"
-    elif not active or not in_win:
+    elif not in_win:
+        # 守夜只属于窗口外。判定时只看 in_win、不看有没有活动：
+        # 窗口内无论多安静都叫空转，把"待机守夜"留给该睡的时段。
         tag = "待机"
         verdict = "待机守夜"
+    elif not active:
+        # 窗口开着却推不动：有排队任务就说是"没人推"，别含糊成"没活可推"
+        tag = "空转"
+        verdict = "窗口开着，但排队中的任务没人推" if pend else "窗口开着，但没活可推"
     elif stuck:
         tag = "卡住(在途超时)"
         verdict = "在途回复超等待上限，疑似 CDP 断了"

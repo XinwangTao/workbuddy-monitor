@@ -863,7 +863,19 @@ s_pend = fresh_state(); stamp(s_pend)
 core.add_task(s_pend, "待发任务A", model="FreeA")
 core.log_heartbeat(s_pend, cfg2, t_at(2))
 _h = _hb()
+check("心跳·待发无活动→空转（不再说守夜）",
+      "监控心跳·空转：" in _h and "守夜" not in _h and "待机" not in _h, f"实际={_h}")
 check("心跳·带待发任务数", "待发 1 条任务" in _h, f"实际={_h}")
+check("心跳·空转有待发→说清是没人推",
+      "排队中的任务没人推" in _h, f"实际={_h}")
+
+# 窗口外 + 有排队任务：仍应是「待机守夜」，不能因为有事可干就改成空转
+s_out = fresh_state(); stamp(s_out)
+core.add_task(s_out, "待发任务B", model="FreeA")
+core.log_heartbeat(s_out, cfg2, t_at(14))
+_h = _hb()
+check("心跳·窗口外+待发 仍是守夜",
+      "监控心跳·待机：待机守夜" in _h, f"实际={_h}")
 
 # ================================================================ 18. 并发写保护
 print("\n== 18. state.json 并发写保护 ==")
