@@ -1217,15 +1217,71 @@ class _CapCDP:
     @staticmethod
     def last_assistant_message(timeout=240, poll=15, prompt_hint=""):
         _cap_seen["hint"] = prompt_hint
-        return "捕获到的回复"
+        return _cap_seen["reply"]
 
 
 sys.modules["workbuddy_cdp"] = _CapCDP
 _camp = {"id": 1, "last_task_id": 1, "last_prompt": "项目目标：真实链路自测：请只回复四个字"}
+# 必须是成句的合法回复：捕获口现在会拦掉过短/无标点的碎片（见 reply_looks_implausible）
+_cap_seen["reply"] = "已定位到该提示词对应的会话，回复可读。"
 _cap = core.try_capture_campaign_result(_camp, cfg2, timeout=1, poll=1)
 check("捕获回复时按 last_prompt 定位会话",
-      _cap == "捕获到的回复" and _cap_seen.get("hint") == "项目目标：真实链路自测：请只回复四个字",
+      _cap == "已定位到该提示词对应的会话，回复可读。"
+      and _cap_seen.get("hint") == "项目目标：真实链路自测：请只回复四个字",
       f"实际={_cap!r} hint={_cap_seen.get('hint')!r}")
+
+# 捕获口的碎片自检：外层注入的短提示词被 CDP 当成助手气泡读回来时，
+# 绝不能当成"本轮产出"推进迭代（否则噪声进 history、冲掉上一轮方向）。
+print("\n== 23b. 捕获口自检：拒收截断/注入碎片 ==")
+check("碎片·过短被判可疑", core.reply_looks_implausible("聚焦后要发送的内容") != "")
+check("碎片·另一段短句被判可疑", core.reply_looks_implausible("另一段要发的内容") != "")
+check("碎片·无标点长句被判可疑",
+      core.reply_looks_implausible("待发送的一大段提示词内容") != "")
+check("空回复被判可疑", core.reply_looks_implausible("") != "")
+check("正常成句回复放行", core.reply_looks_implausible("已补回归测试，全量 299/0 通过。") == "")
+check("极短但带 [[NEXT]] 的回复放行（模型只给方向也有效）",
+      core.reply_looks_implausible("[[NEXT]]去跑一遍回归。[[/NEXT]]") == "")
+
+# 端到端：捕获到碎片 → 不推进本轮、方向保持原样
+_noise_seen = {}
+
+
+class _NoiseCDP:
+    @staticmethod
+    def last_assistant_message(timeout=240, poll=15, prompt_hint=""):
+        _noise_seen["calls"] = _noise_seen.get("calls", 0) + 1
+        return "聚焦后要发送的内容"
+
+
+sys.modules["workbuddy_cdp"] = _NoiseCDP
+stnz = fresh_state()
+stnz["model_catalog"] = [{"name": "FreeA", "free": True}]
+stamp(stnz)
+FAKE["reply"] = "聚焦后要发送的内容"
+cnz = core.create_campaign(stnz, "碎片注入目标", strategy="autopilot",
+                           model="FreeA", max_iterations=0)
+core.ensure_campaign_task(cnz, stnz, cfg2, t_at(2))
+cnz["next_step"] = "上一轮定下的方向：先跑通全量回归"   # 预置方向，验证不被冲掉
+core.save_state(stnz)                                   # 先落盘预置方向
+# 再标 sent，且必须放在 save_state 之后：save_state 整体写回内存视图，
+# 顺序反了会把刚落盘的 sent 覆盖回 pending，用例就退化成"分支根本没走到"。
+core.update_task(cnz["last_task_id"], status="sent")
+_stnz = core.load_state()
+core.run_iteration_step(_stnz, cfg2, t_at(2))          # now=t+2 秒：远未到等待上限
+cnzr = core.campaign_by_id(_stnz, cnz["id"])
+check("确实走到了捕获分支（否则上面几条都是空过）",
+      _noise_seen.get("calls", 0) >= 1, f"实际调用={_noise_seen.get('calls')}")
+check("碎片回复不被当成本轮产出（轮次不前进）",
+      cnzr["current_iteration"] == 0, f"实际={cnzr['current_iteration']}")
+check("碎片回复不进 history", len(cnzr.get("history") or []) == 0)
+check("碎片回复冲不掉上一轮方向",
+      cnzr.get("next_step") == "上一轮定下的方向：先跑通全量回归",
+      f"实际={cnzr.get('next_step')!r}")
+check("仍视为在途等待（不误判为失败推进）", cnzr["awaiting_result"] is True)
+check("静默丢弃改记 warn（日志里能查到被拒原因）",
+      "可疑" in core.LOG_FILE.read_text(encoding="utf-8-sig"))
+core.set_campaign_status(core.load_state(), cnz["id"], "paused")
+sys.modules["workbuddy_cdp"] = _fake_cdp
 
 # ================================================================ 24. autopilot：模型自主决定下一步方向
 print("\n== 24. autopilot（方向由 WorkBuddy 自己决定）==")

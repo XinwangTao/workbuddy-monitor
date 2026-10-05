@@ -1246,6 +1246,26 @@ NEXT_STEP_FALLBACK = ("补一处可复现的真实缺陷并钉住它：先读代
                       "只改那一处，补一条离线回归测试跑通它，"
                       "汇报改了哪些文件与验证结果（通过/失败）。")
 
+# 一轮真实产出的最小体量。实测：外层调度把「聚焦后要发送的内容」这类**碎片提示词**
+# 回灌进会话时，CDP 会把它们当成助手气泡读回来；旧代码不设防，直接当本轮产出推进，
+# 于是噪声进了 history、冲掉了上一轮方向、还被下一轮当作"上一轮产出"续写，越跑越歪。
+# 真正的迭代回复是一段成句的自述（带标点）；碎片既短又完全无标点，两个特征都成立。
+_MIN_REPLY_CHARS = 10
+_REPLY_PUNCT_RE = re.compile(r"[。！？；：,.!?;:]")
+
+
+def reply_looks_implausible(text: str) -> str:
+    """回复是否可疑到不能当本轮产出用。正常返回 ""，可疑时返回中文原因。
+
+    注意：**带 [[NEXT]] 标记的一律放行**——程序只从标记里取方向，
+    模型完全可以给一句极短的方向而不啰嗦，那仍是有效产出。"""
+    t = (text or "").strip()
+    if len(t) < _MIN_REPLY_CHARS:
+        return f"过短（{len(t)}<{_MIN_REPLY_CHARS} 字）"
+    if NEXT_STEP_OPEN not in t and not _REPLY_PUNCT_RE.search(t):
+        return "无 [[NEXT]] 标记也无任何标点（疑似截断/注入的碎片）"
+    return ""
+
 
 def _build_autopilot_prompt(camp, it: int, last: str, failed: bool) -> str:
     """构造 autopilot 策略的本轮提示词。
@@ -1451,10 +1471,25 @@ def _task_content_hint(camp) -> str:
         return ""
 
 
+def _gate_reply(camp, msg) -> bool:
+    """捕获到的文本是否可信。不可信则记 warn 并返回 False（**不推进本轮、保留上一轮方向**）。
+
+    warn 必须是 warn 而不是静默丢：这类内容通常意味着会话定位错了或外层回灌了碎片，
+    不报出来下次还是同样的错，排查的人只会看到"没产出"而看不到为什么。"""
+    why = reply_looks_implausible(msg)
+    if not why:
+        return True
+    log(f"迭代活动 #{camp.get('id')} 捕获到的回复可疑（{why}），已丢弃并保留上一轮方向，"
+        f"不记为本轮产出：{_truncate(msg, 40)}")
+    return False
+
+
 def try_capture_campaign_result(camp, cfg, timeout=240, poll=15):
     """尝试读取 WorkBuddy 对 camp.last_task_id 的回复。返回文本或 None（未就绪/超时/不可用）。
 
     捕获顺序：① WorkBuddy CDP DOM ② 回复缓存文件（CDP 读不到时由接收方写入）。
+    两条路返回的文本都要过 `_gate_reply`：体量不足/不成句的"回复"是截断或注入碎片，
+    放过去会让噪声变成本轮产出与下一轮上下文。
 
     hint 用 camp.last_prompt：WorkBuddy 发送后会回到会话列表，必须能定位回
     刚才那条会话，否则会读到别的会话的回复，把无关内容当成本轮迭代产出。"""
@@ -1463,7 +1498,7 @@ def try_capture_campaign_result(camp, cfg, timeout=240, poll=15):
         import workbuddy_cdp
         msg = workbuddy_cdp.last_assistant_message(
             timeout=timeout, poll=poll, prompt_hint=hint)
-        if msg:
+        if msg and _gate_reply(camp, msg):
             return msg
         # 主 hint（last_prompt）定位不到会话时的兜底：改用本轮任务原文作 hint。
         # 场景：活动是恢复的/last_prompt 被覆盖，但用户气泡内容=任务原文，
@@ -1473,13 +1508,13 @@ def try_capture_campaign_result(camp, cfg, timeout=240, poll=15):
             log("迭代回复捕获：last_prompt 未命中，改用任务原文定位会话重试")
             msg = workbuddy_cdp.last_assistant_message(
                 timeout=min(timeout, 60), poll=poll, prompt_hint=task_hint)
-            if msg:
+            if msg and _gate_reply(camp, msg):
                 return msg
     except Exception as e:
         log(f"迭代读取 WorkBuddy 回复失败(CDP, 尝试回退源): {e}")
     # 回退源：回复缓存文件
     cached = _read_reply_cache_file(camp, cfg)
-    if cached:
+    if cached and _gate_reply(camp, cached):
         log("迭代回复改由缓存文件捕获（CDP DOM 不可用）")
         return cached
     return None
