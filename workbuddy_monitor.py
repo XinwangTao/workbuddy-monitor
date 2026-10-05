@@ -246,8 +246,67 @@ def log(msg: str):
         pass
 
 
+def _fmt_dur(sec) -> str:
+    """秒 → 短时长：'45s' / '12m' / '6h13m'。负数或 None 记 '—'，绝不抛异常。"""
+    try:
+        sec = int(sec)
+    except (TypeError, ValueError):
+        return "—"
+    if sec < 0:
+        return "—"
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m"
+    h, m = divmod(sec // 60, 60)
+    return f"{h}h{m:02d}m" if m else f"{h}h"
+
+
+def _ago_text(dt, now) -> str:
+    """datetime → 人话：'刚刚' / '4 分钟前' / '3 小时 12 分前' / '2 天前'。"""
+    if not dt:
+        return "—"
+    try:
+        sec = (now - dt).total_seconds()
+    except TypeError:
+        return "—"
+    if sec < 60:
+        return "刚刚"
+    if sec < 3600:
+        return f"{int(sec // 60)} 分钟前"
+    if sec < 86400:
+        h, m = int(sec // 3600), int(sec % 3600 // 60)
+        return f"{h} 小时 {m} 分前" if m else f"{h} 小时前"
+    return f"{int(sec // 86400)} 天前"
+
+
+def _window_left(win: dict, now) -> str:
+    """窗口内 → '剩6h13m'；窗口外 → '14h 后开窗'。跨午夜窗口同样算得对。"""
+    try:
+        sh, sm = map(int, str(win.get("start", "23:00")).split(":"))
+        eh, em = map(int, str(win.get("end", "08:00")).split(":"))
+    except (ValueError, AttributeError):
+        return ""
+    smin, emin = sh * 60 + sm, eh * 60 + em
+    cur = now.hour * 60 + now.minute
+    if in_window(win, now):
+        end = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if (end.hour * 60 + end.minute) <= cur:
+            end += timedelta(days=1)
+        return f"剩{_fmt_dur((end - now).total_seconds())}"
+    start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    if (start.hour * 60 + start.minute) <= cur:
+        start += timedelta(days=1)
+    return f"{_fmt_dur((start - now).total_seconds())} 后开窗"
+
+
 def log_heartbeat(state: dict, cfg: dict, now=None):
-    """周期性心跳：让"昨晚监控是否在岗"可被事后审计，而不是只能靠推断。"""
+    """周期性心跳：让"昨晚监控在不在岗、有没有真在推进"一眼可读。
+
+    输出是一句话，不是管道拼字段：先给结论（在跑/待机/被拦/卡住），
+    再补证据（窗口、轮次、排队数、距上次动作）。仍保留 `监控心跳` 前缀，
+    旧 grep 与回归测试不受影响；活动 id 平时不进日志（噪音），
+    只有真卡住时才带上，因为那时你必须知道是哪条活动僵了。"""
     now = now or datetime.now()
     auto = cfg.get("auto_send", {}) or {}
     win = effective_free_window(state, None, cfg)
@@ -255,18 +314,69 @@ def log_heartbeat(state: dict, cfg: dict, now=None):
     paused = balance_guard_paused(state)
     active = [c for c in ensure_campaigns(state) if c.get("status") == "running"]
     pend = len(pending_tasks(state))
-    parts = [
-        "监控心跳",
-        f"免费时段 {win['start']}-{win['end']}({'窗口内' if in_win else '窗口外'})",
-        f"余额守卫={'暂停' if paused else '正常'}",
-        f"活跃迭代={len(active)}",
-        f"待发任务={pend}",
-    ]
-    if active:
-        c = active[0]
-        parts.append(f"活动#{c['id']} 已{c.get('current_iteration', 0)}轮"
-                     f"{'(等待回复)' if c.get('awaiting_result') else ''}")
-    log(" | ".join(parts))
+
+    # 在途回复等太久 = CDP 断了或回复捕获失败，比"进程还活着"更值得报警
+    await_timeout = int(auto.get("await_timeout", 1800) or 1800)
+    stuck = None
+    last_act = None
+    for c in active:
+        t = _parse_dt(c.get("awaiting_result_at")) if c.get("awaiting_result") else None
+        if t and (last_act is None or t > last_act):
+            last_act = t
+        if t and (now - t).total_seconds() > await_timeout:
+            if stuck is None or t > stuck["t"]:
+                stuck = {"t": t, "c": c}
+
+    # 判定顺序即优先级：白天窗口外本来就不该推进，那里报"卡住"是误报，
+    # 所以"待机/空转"都要排在"卡住"之前。
+    if paused:
+        tag = "被拦(余额守卫)"
+        verdict = "被余额守卫拦住了，不推任务"
+    elif not active and not pend:
+        # 窗口内但无事可做：这叫空转，不能写成"待机守夜"——
+        # 守夜是窗口外的正常状态，混在一起就分不出"它在岗"和"它没活干"
+        tag = "空转"
+        verdict = "窗口开着，但没活可推"
+    elif not active or not in_win:
+        tag = "待机"
+        verdict = "待机守夜"
+    elif stuck:
+        tag = "卡住(在途超时)"
+        verdict = "在途回复超等待上限，疑似 CDP 断了"
+    else:
+        tag = "在跑"
+        verdict = "正在推进"
+
+    wl = _window_left(win, now)
+    seg_win = f"免费时段{'内' if in_win else '外'} {win.get('start', '?')}-{win.get('end', '?')}，{wl}"
+
+    c = (stuck or {}).get("c") or (active[0] if active else None)
+    if c:
+        it = int(c.get("current_iteration", 0) or 0)
+        if stuck:
+            elapsed = _fmt_dur((now - stuck["t"]).total_seconds())
+            seg_camp = f"；迭代 #{c['id']} 第{it}轮在途回复已等 {elapsed}（超 {await_timeout}s）"
+        elif paused:
+            # 停了就不能再说"推进到"，否则和前面的"不推任务"自相矛盾
+            seg_camp = f"；{len(active)} 个迭代活动挂在已发第 {it} 轮"
+        else:
+            seg_camp = f"；{len(active)} 个迭代活动推进到第 {it} 轮" + (
+                "、在等模型回复" if c.get("awaiting_result") else "、正在推进")
+    else:
+        seg_camp = "；无迭代活动在跑" if not paused else "；迭代活动已全部挂起"
+
+    # 心跳在 ≠ 在干活：把"距上次真实推进多久"摆到明面上
+    if last_act is None:
+        cand = [_parse_dt(t.get("scheduled_time")) for t in state.get("tasks", []) or [] if t.get("scheduled_time")]
+        cand = [d for d in cand if d]
+        last_act = max(cand) if cand else None
+    # 卡住时"上次动作"和上面"已等 Xm"是同一件事的两个说法，并列读起来像重复报警
+    seg_last = "" if stuck else (
+        f"；上次动作 {_ago_text(last_act, now)}" if last_act is not None else "")
+
+    seg_pend = f"；待发 {pend} 条任务" if pend else "；无待发任务"
+    log(f"监控心跳·{tag}：{verdict}——{seg_win}{seg_camp}{seg_pend}{seg_last}。")
+
 
 # ---------------------------------------------------------------------------
 # 限流消息解析
@@ -1631,6 +1741,21 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
     返回 (ok, message)。发送后会校验「输入框已清空」或「对话里出现本轮内容」，
     两者至少满足其一才认为发送成功；否则返回 False，让上层把任务标回 pending
     重试，绝不静默丢消息。"""
+    # 幂等去重：真实事故——发送后校验因页面切换读空误判失败，任务被重试
+    # 3 次造成同一内容发进 3 个会话。发送前先查一次，已存在即按成功返回。
+    try:
+        import workbuddy_cdp as _cdp_dedup
+        if _cdp_dedup.is_workbuddy_running() and \
+                hasattr(_cdp_dedup, "read_conversation"):
+            conv = _cdp_dedup.read_conversation()  # 读不到对话→无法证实，不做去重
+            head_d = (content or "").strip()[:40]
+            if (conv and head_d
+                    and any(m.get("role") == "user"
+                            and head_d in (m.get("text") or "") for m in conv)):
+                log("发现相同消息已存在于当前会话中（幂等去重），不再重复发送")
+                return True, "已存在相同消息，按已发送处理（幂等去重）"
+    except Exception:
+        pass
     prev_clip = _get_clipboard_text()
     if not set_clipboard_text(content):
         return False, "写入剪贴板失败"
@@ -1704,7 +1829,7 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
         if not _editor_has_text(content) and not injected:
             return False, "粘贴未生效（内容未进入输入框），已取消发送"
     _enter()
-    time.sleep(0.8)
+    time.sleep(2.0)  # WorkBuddy 提交后要建会话/回列表，立即读会读到空页
     # 还原用户剪贴板
     if prev_clip:
         set_clipboard_text(prev_clip)
@@ -1718,7 +1843,7 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
     return True, "已自动粘贴并发送到 WorkBuddy"
 
 
-def _sent_message_present_in_conversation(content: str, tries: int = 4) -> bool:
+def _sent_message_present_in_conversation(content: str, tries: int = 6) -> bool:
     """发送后确认消息确实进入了对话（存在含该内容的用户气泡）。
 
     仅看“输入框被清空”是必要不充分条件：粘贴可能根本没落地、或提交被静默吞掉，
@@ -1735,7 +1860,9 @@ def _sent_message_present_in_conversation(content: str, tries: int = 4) -> bool:
     head = (content or "").strip()[:40]
     if not head:
         return True
-    for _ in range(max(1, tries)):
+    for attempt in range(max(1, tries)):
+        if attempt == 1:
+            time.sleep(2.0)  # 第一次读不到多半是页面切换中，多等一会再试
         conv = None
         try:
             if workbuddy_cdp._in_conversation_page():
