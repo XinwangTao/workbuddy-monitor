@@ -10,3 +10,5 @@ launch.log
 monitor.old.log
 campaign_reply.txt
 state.json.bak
+night_run.log
+reply_cache/

@@ -1316,6 +1316,17 @@ def ensure_campaign_task(camp, state, cfg, now):
     return task
 
 
+def _task_content_hint(camp) -> str:
+    """取 camp.last_task_id 对应任务的原文前缀作为会话定位兜底 hint。"""
+    try:
+        st = load_state()
+        tid = camp.get("last_task_id")
+        t = next((x for x in st.get("tasks", []) if x.get("id") == tid), None)
+        return (t.get("content") or "").strip() if t else ""
+    except Exception:
+        return ""
+
+
 def try_capture_campaign_result(camp, cfg, timeout=240, poll=15):
     """尝试读取 WorkBuddy 对 camp.last_task_id 的回复。返回文本或 None（未就绪/超时/不可用）。
 
@@ -1330,6 +1341,16 @@ def try_capture_campaign_result(camp, cfg, timeout=240, poll=15):
             timeout=timeout, poll=poll, prompt_hint=hint)
         if msg:
             return msg
+        # 主 hint（last_prompt）定位不到会话时的兜底：改用本轮任务原文作 hint。
+        # 场景：活动是恢复的/last_prompt 被覆盖，但用户气泡内容=任务原文，
+        # 按任务原文前缀仍能精确定位到本轮会话与回复。
+        task_hint = _task_content_hint(camp)
+        if task_hint and task_hint != hint:
+            log("迭代回复捕获：last_prompt 未命中，改用任务原文定位会话重试")
+            msg = workbuddy_cdp.last_assistant_message(
+                timeout=min(timeout, 60), poll=poll, prompt_hint=task_hint)
+            if msg:
+                return msg
     except Exception as e:
         log(f"迭代读取 WorkBuddy 回复失败(CDP, 尝试回退源): {e}")
     # 回退源：回复缓存文件
@@ -2177,8 +2198,73 @@ def run_loop(cfg: dict, once: bool = False):
         time.sleep(interval)
 
 # ---------------------------------------------------------------------------
-# CLI
+# 夜间无人值守：免费窗口内持续 autopilot 迭代，窗口结束自动收尾
 # ---------------------------------------------------------------------------
+def run_night_runner(cfg: dict, goal: str, max_rounds: int = 20,
+                     strategy: str = "autopilot") -> int:
+    """夜间自动跑：创建/恢复 autopilot 迭代活动，免费窗口内持续推进。
+
+    与 run_loop 的区别：
+    - 启动即确保存在一个 running 的迭代活动（没有就创建，暂停的安全活动
+      不自动恢复——那些因「额度用完/模型不再免费」暂停的活动必须人工复核）；
+    - 窗口结束（in_free_window=False）或所有活动跑完即退出，便于配成
+      计划任务每晚拉起一次；
+    - 返回本轮推进的轮数（供计划任务日志）。
+    安全底线不变：任何一轮无法确认免费通道（免费模型消失/目录过期/余额
+    异常），活动会被 run_iteration_step 自动暂停，night runner 检测到无
+    活跃活动后退出，绝不改走积分通道。"""
+    state = load_state()
+    camps = ensure_campaigns(state)
+    running = [c for c in camps if c.get("status") == "running"]
+    if not running:
+        # 找同目标的暂停活动不自动恢复（暂停原因需人工确认），只新建
+        camp = create_campaign(state, goal, strategy=strategy,
+                               model="", max_iterations=0)
+        log(f"夜间模式：已新建 autopilot 活动 #{camp['id']}")
+    else:
+        log(f"夜间模式：复用 {len(running)} 个进行中的迭代活动")
+    if goal and not (state.get("model_catalog") or []):
+        # 首次跑目录为空时先做一次免费发现，避免第一轮就因目录过期暂停
+        try:
+            discover_free_models(cfg, None)
+            discover_free_window(cfg, None)
+        except Exception as e:
+            log(f"夜间模式：免费发现失败（将靠下一轮自愈）: {e}")
+
+    rounds = 0
+    interval = max(10, int(cfg.get("poll_interval", 30)))
+    while True:
+        now = datetime.now()
+        if not in_free_window(cfg, now, load_state()):
+            log(f"免费窗口已结束（当前 {now:%H:%M}），夜间模式收尾。本轮共推进 {rounds} 轮")
+            break
+        try:
+            info = monitor_tick(cfg)
+        except Exception as e:
+            log(f"夜间模式单轮异常(已跳过): {e}")
+            info = {}
+        done = _count_new_rounds(load_state())
+        if done > rounds:
+            rounds = done
+            log(f"夜间进度: 已完成 {rounds} 轮迭代")
+        # 所有活动都暂停/结束 → 退出（安全原因暂停由人工复核后恢复）
+        st = load_state()
+        if not active_campaigns(st):
+            log("所有迭代活动已暂停或完成，夜间模式退出")
+            break
+        if max_rounds and rounds >= max_rounds:
+            log(f"已达单夜轮数上限 {max_rounds}，夜间模式退出")
+            break
+        time.sleep(interval)
+    return rounds
+
+
+def _count_new_rounds(state) -> int:
+    """所有活动累计完成的迭代轮数（用于夜间进度统计）。"""
+    return sum(int(c.get("current_iteration") or 0)
+               for c in ensure_campaigns(state))
+
+
 def main():
     p = argparse.ArgumentParser(description="WorkBuddy 用量/余额监控")
     p.add_argument("--add", metavar="TEXT", help="添加任务")
@@ -2210,6 +2296,9 @@ def main():
     p.add_argument("--clear", action="store_true", help="清空已发送任务")
     p.add_argument("--parse", metavar="TEXT", help="解析一条限流消息（测试）")
     p.add_argument("--once", action="store_true", help="单次检查后退出")
+    p.add_argument("--night", metavar="GOAL", help="夜间无人值守：免费窗口内持续 autopilot 迭代，窗口结束自动退出")
+    p.add_argument("--night-max", type=int, default=20, metavar="N",
+                   help="单夜最多推进轮数（默认 20，0=不限）")
     p.add_argument("--doctor", action="store_true",
                    help="启动自检：WorkBuddy/CDP、免费保护开关、免费模型与时段、活跃迭代")
     p.add_argument("--report", action="store_true",
@@ -2374,6 +2463,10 @@ def main():
         if camp.get("repo_path"):
             print(f"代码自迭代目录: {camp['repo_path']}  验证命令: {camp['test_cmd'] or '(默认 py_compile)'}")
         print("启动监控（python workbuddy_monitor.py 或界面点启动监控）后，将在免费时段内自动迭代。")
+        return
+
+    if args.night:
+        run_night_runner(cfg, args.night, max_rounds=args.night_max)
         return
 
     run_loop(cfg, once=args.once)

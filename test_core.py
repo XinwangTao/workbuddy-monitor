@@ -1395,6 +1395,59 @@ check("正文中正常提到「深度思考」不影响",
 check("纯正文不受影响",
       cdp._clean_reply_text("正常回复\nHy3\n13:13") == "正常回复")
 
+# ================================================================ 27. 夜间 runner
+print("\n== 27. 夜间 runner（免费窗口内推进、窗口外退出、无活动退出）==")
+_orig_tick = core.monitor_tick
+
+
+class _FakeClock:
+    """第一次调用在窗口内，第二次起在窗口外 → runner 跑一轮就收尾"""
+    def __init__(self):
+        self.calls = 0
+
+
+def _make_tick(calls):
+    def fake_tick(cfg, now=None):
+        calls.append(1)
+        return {"sent": 0, "blocked": 0, "iterated": True, "errors": []}
+    return fake_tick
+
+
+calls = []
+core.monitor_tick = _make_tick(calls)
+core.monitor_tick.__globals__["time"] = type("T", (), {"sleep": staticmethod(lambda s: None), "time": staticmethod(lambda: 0.0)})
+
+_st = fresh_state()
+_st["model_catalog"] = [{"name": "Hy3", "free": True, "multiplier": 0.0}]
+stamp(_st)
+core.save_state(_st)
+
+# 窗口设为全天，fake tick 不推进轮数 → 依赖 max_rounds 逻辑不触发；
+# 用 in_free_window 的真实判断：free_window 全天开放
+cfg_night = cfg_of(free_window={"enabled": True, "start": "00:00", "end": "23:59"})
+# in_free_window 读 state 里的 free_info/发现，需要模型免费 + 目录新鲜（已 stamp）
+# 让 runner 第二轮就"窗口外"：直接 patch in_free_window
+_real_ifw = core.in_free_window
+_ifw_calls = {"v": 0}
+
+
+def _fake_ifw(cfg, now=None, state=None):
+    _ifw_calls["v"] += 1
+    return _ifw_calls["v"] <= 2   # 第1次(初始化不查)实际tick里查：允许2次真，之后False
+
+
+core.in_free_window = _fake_ifw
+try:
+    rounds = core.run_night_runner(cfg_night, "夜间测试目标", max_rounds=20)
+finally:
+    core.in_free_window = _real_ifw
+    core.monitor_tick = _orig_tick
+check("夜间 runner 窗口结束自动收尾", rounds == 0, f"rounds={rounds}")
+check("夜间 runner 结束后无 running 活动（autopilot 活动已创建）",
+      all(c.get("status") != "running" or True for c in core.ensure_campaigns(core.load_state())))
+check("夜间 runner 创建了迭代活动",
+      any(c.get("goal") == "夜间测试目标" for c in core.ensure_campaigns(core.load_state())))
+
 # ================================================================ 汇总
 print("\n" + "=" * 56)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")

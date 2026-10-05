@@ -523,13 +523,33 @@ def _ensure_conversation_open(prompt_hint: str = "") -> bool:
                 time.sleep(1.2)
                 if _in_conversation_page():
                     return True
-    if _in_conversation_page():
-        # 无 hint 且已在对话页：直接复用当前会话
-        return True
+        # 标题定位失败（旧会话可能已滚出虚拟列表）：若当前停在某个对话页，
+        # 只有该页确实包含本轮提示词才可复用——绝不能在无关对话页短路，
+        # 那会读到别的会话/上一轮的回复。否则退回最新会话，由下方 hint
+        # 匹配兜底校验（latest 常是本轮会话）。
+        if _in_conversation_page() and _conversation_has_prompt(hint):
+            return True
     if _open_latest_conversation():
         time.sleep(1.2)
-        return _in_conversation_page()
+        if not _in_conversation_page():
+            return False
+        # 带 hint 时最新会话也必须真的包含本轮提示词；
+        # 不带 hint 由 _find_reply_after 的提示词匹配兜底。
+        return not hint or _conversation_has_prompt(hint)
     return False
+
+
+def _conversation_has_prompt(hint: str) -> bool:
+    """当前对话页的用户消息里是否真的包含 prompt_hint 开头（归一化后）。"""
+    conv = read_conversation()
+    if not conv:
+        return False
+    head = _norm_for_match(hint)[:_HINT_MIN_OVERLAP]
+    if not head:
+        return False
+    return any(m.get("role") == "user"
+               and head in _norm_for_match(m.get("text") or "")
+               for m in conv)
 
 
 def read_conversation():
@@ -661,7 +681,10 @@ def last_assistant_message(timeout=240, poll=15, prompt_hint=""):
 
     读不到 / 判断为噪声 / 仍在生成中时一律返回 None
     （调用方据此按未完成处理，绝不拿噪声或旧回复推进迭代）。"""
-    _ensure_conversation_open(prompt_hint)
+    if not _ensure_conversation_open(prompt_hint):
+        # 带 hint 却定位不到包含该提示词的会话：立刻失败。
+        # 绝不留在无关会话里轮询——那只会白等并可能读到过期回复。
+        return None
     deadline = time.time() + max(poll, timeout)
     while time.time() < deadline:
         raw = _read_last_agent_reply(prompt_hint)
