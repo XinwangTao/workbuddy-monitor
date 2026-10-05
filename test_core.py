@@ -496,6 +496,31 @@ for i in range(3):
 check("连续多轮迭代持续推进", ce_r["current_iteration"] == 4, f"实际={ce_r['current_iteration']}")
 check("无限迭代下仍 running", ce_r["status"] == "running")
 
+# 在途任务 failed 后不得永久卡死 awaiting_result（真实事故：runner 并发期间
+# 发送 3 次失败任务标 failed，活动仍 awaiting → 永久空等）
+print("\n== 11b. 在途任务 failed → 清除等待并重新生成 ==")
+stfail = core.load_state()   # 用当前全量状态的副本，不落盘（避免删掉前面用例的活动）
+stfail["model_catalog"] = [{"name": "FreeA", "free": True}]
+stamp(stfail)
+FAKE["reply"] = "失败后的新一轮产出。"
+cfail = core.create_campaign(stfail, "失败恢复目标", strategy="improve", max_iterations=0)
+core.ensure_campaign_task(cfail, stfail, cfg2, t_at(2))
+_failed_tid = cfail["last_task_id"]   # 必须在步进前捕获，步进后已是新任务 id
+for t in stfail["tasks"]:
+    if t["id"] == _failed_tid:
+        t["status"] = "failed"
+        t["last_error"] = "粘贴未生效（内容未进入输入框），已取消发送"
+core.run_iteration_step(stfail, cfg2, t_at(2))
+cfr = core.campaign_by_id(stfail, cfail["id"])
+check("failed 任务被清除等待后重新生成新一轮在途任务",
+      cfr["awaiting_result"] is True and cfr["last_task_id"] != _failed_tid,
+      f"awaiting={cfr['awaiting_result']} new_tid={cfr['last_task_id']}")
+check("failed 计入错误计数", int(cfr.get("error_count") or 0) >= 1,
+      f"实际={cfr.get('error_count')}")
+check("活动仍 running 可继续", cfr["status"] == "running")
+# 清理：暂停本用例创建的活动，避免污染后续用例的活跃列表
+core.set_campaign_status(core.load_state(), cfail["id"], "paused")
+
 # 暂停/恢复
 core.set_campaign_status(core.load_state(), ce["id"], "paused")
 stp = core.load_state()

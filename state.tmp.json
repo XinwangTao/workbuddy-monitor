@@ -1,0 +1,54 @@
+{
+  "tasks": [
+    {
+      "id": 1791168097957,
+      "content": "项目目标：复现失败恢复\n这是第 1 轮自主迭代。请直接动手改进并给出结果（纯文本/代码，不要触发消耗积分的多模态功能）。\n上一轮产出摘要（节选）供参考：\n\n\n本轮优化方向：实现项目核心功能，产出可运行的第一版\n请围绕该方向改进当前项目。",
+      "model": "FreeA",
+      "created": "2026-10-05 10:41:37",
+      "scheduled_time": null,
+      "allow_credit": false,
+      "status": "failed",
+      "campaign_id": 1791168097955,
+      "last_error": "粘贴未生效"
+    }
+  ],
+  "rate_limits": {},
+  "model_catalog": [
+    {
+      "name": "FreeA",
+      "free": true
+    }
+  ],
+  "free_info": {
+    "models_discovered_at": "2026-10-05 10:41:37"
+  },
+  "campaigns": [
+    {
+      "id": 1791168097955,
+      "goal": "复现失败恢复",
+      "strategy": "improve",
+      "model": "",
+      "stages": [],
+      "max_iterations": 0,
+      "repo_path": "",
+      "test_cmd": "",
+      "current_iteration": 0,
+      "stage_index": 0,
+      "status": "paused",
+      "created": "2026-10-05 10:41:37",
+      "last_prompt": "项目目标：复现失败恢复\n这是第 1 轮自主迭代。请直接动手改进并给出结果（纯文本/代码，不要触发消耗积分的多模态功能）。\n上一轮产出摘要（节选）供参考：\n\n\n本轮优化方向：实现项目核心功能，产出可运行的第一版\n请围绕该方向改进当前项目。",
+      "last_result": "",
+      "last_task_id": 1791168097957,
+      "awaiting_result": true,
+      "awaiting_result_at": "2026-10-05 10:41:37",
+      "error_count": 0,
+      "stagnation": false,
+      "no_code_change_count": 0,
+      "next_step": "",
+      "next_step_missing": 0,
+      "history": [],
+      "pause_reason": "模型 FreeA 的免费时段为 23:00-08:00，当前不在免费时段",
+      "paused_at": "2026-10-05 10:41:37"
+    }
+  ]
+}

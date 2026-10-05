@@ -842,6 +842,58 @@ def start_new_conversation() -> bool:
         return False
 
 
+# 输入框聚焦表达式（focus_editor 与 insert_text_into_editor 共用）
+_JS_FOCUS_EDITOR = r"""
+(() => {
+  const eds = [...document.querySelectorAll(
+      '[contenteditable="true"], textarea, .cr-editor, [class*="editable"]')];
+  const vis = eds.filter(e => {
+    const r = e.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  const el = vis[vis.length - 1] || eds[eds.length - 1];
+  if (!el) return "no-editor";
+  const o = {bubbles: true, cancelable: true, view: window};
+  el.dispatchEvent(new PointerEvent("pointerdown", o));
+  el.dispatchEvent(new MouseEvent("mousedown", o));
+  el.dispatchEvent(new PointerEvent("pointerup", o));
+  el.dispatchEvent(new MouseEvent("mouseup", o));
+  el.dispatchEvent(new MouseEvent("click", o));
+  el.focus();
+  const ae = document.activeElement;
+  if (el === ae || el.contains(ae)) return "focused";
+  return "focus-failed";
+})()
+"""
+
+
+def insert_text_into_editor(text: str) -> bool:
+    """通过 CDP Input.insertText 把文本直接注入已聚焦的输入框。
+
+    为什么存在：剪贴板 Ctrl+V 链路依赖「窗口激活→系统焦点→编辑器焦点」
+    三层全部成立，真实环境里前台锁定/焦点偶发丢失会让粘贴静默落空。
+    Input.insertText 是浏览器内核级注入，只要求编辑器在页面内拿到焦点
+    （focus_editor 负责这一步），不依赖剪贴板、不依赖系统前台。
+    注入后用 editor_contains 自校验。返回 True 表示文本确实进入了输入框。"""
+    if not text:
+        return False
+    t = _find_page_target()
+    if not t:
+        return False
+    try:
+        with _Cdp(t) as c:
+            r = c.call("Runtime.evaluate",
+                       {"expression": _JS_FOCUS_EDITOR,
+                        "returnByValue": True, "awaitPromise": True})
+            if r.get("result", {}).get("value") != "focused":
+                return False
+            c.call("Input.insertText", {"text": text}, timeout=10)
+        # 自校验：前 40 字必须真的出现在输入框里
+        return editor_contains(text.strip()[:40])
+    except Exception:
+        return False
+
+
 def focus_editor() -> bool:
     """把 WorkBuddy 输入框拉到焦点状态（CDP 直接 DOM focus）。
 

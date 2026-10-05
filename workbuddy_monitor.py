@@ -1415,6 +1415,18 @@ def run_iteration_step(state, cfg, now=None):
                         ensure_campaign_task(camp, state, cfg, now)
                 # 未超时也未捕获（CDP 不可用或仍在流式输出）则保持 awaiting，下轮继续
                 continue
+            elif t.get("status") == "failed":
+                # 发送失败的任务不能永远挂在 awaiting_result 上——
+                # 否则活动会永久卡在「等待一个永远不会到达的回复」。
+                # 清除在途标记，按失败推进（计入错误计数），重新生成任务。
+                log(f"迭代活动 #{camp['id']} 在途任务 #{t['id']} 发送失败"
+                    f"（{(t.get('last_error') or '')[:60]}），清除等待状态重新生成")
+                camp["awaiting_result"] = False
+                camp["last_task_id"] = None
+                camp["error_count"] = int(camp.get("error_count") or 0) + 1
+                save_state(state)
+                if camp.get("status") == "running":
+                    ensure_campaign_task(camp, state, cfg, now)
             else:
                 # 仍在 pending：等统一调度循环发送
                 continue
@@ -1658,21 +1670,38 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
             log("CDP 不可用，跳过新建会话步骤")
     except Exception as e:
         log(f"新建会话步骤异常（忽略，继续原流程）: {e}")
-    _ctrl_v()
-    time.sleep(1.0)  # 等输入框渲染完粘贴内容
+    # 首选：CDP 内核级注入（Input.insertText），不依赖剪贴板/前台/系统焦点
+    # 三层链路。真实环境里 select_model 等下拉交互后编辑器焦点偶发丢失，
+    # Ctrl+V 会静默落空；CDP 注入只要求编辑器在页面内拿到焦点。
+    injected = False
+    try:
+        import workbuddy_cdp as _cdp_mod
+        if _cdp_mod.is_workbuddy_running():
+            injected = _cdp_mod.insert_text_into_editor(content)
+            if injected:
+                log("已通过 CDP 直接注入文本到输入框（免剪贴板）")
+    except Exception as e:
+        log(f"CDP 注入文本异常（转剪贴板路径）: {e}")
+    if not injected:
+        _ctrl_v()
+        time.sleep(1.0)  # 等输入框渲染完粘贴内容
     # 关键兜底：确认粘贴真的落进了输入框，避免把空消息发出去
-    if not _editor_has_text(content):
+    if not _editor_has_text(content) and not injected:
         # 重试一次：重新激活窗口 → 重新聚焦编辑器 → 再粘贴（焦点偶发丢失）
         _activate_window(hwnd)
         time.sleep(0.4)
         try:
             import workbuddy_cdp
             workbuddy_cdp.focus_editor()
+            injected = workbuddy_cdp.insert_text_into_editor(content)
+            if injected:
+                log("重试：已通过 CDP 直接注入文本到输入框")
         except Exception:
             pass
-        _ctrl_v()
-        time.sleep(1.0)
-        if not _editor_has_text(content):
+        if not injected:
+            _ctrl_v()
+            time.sleep(1.0)
+        if not _editor_has_text(content) and not injected:
             return False, "粘贴未生效（内容未进入输入框），已取消发送"
     _enter()
     time.sleep(0.8)
@@ -2232,6 +2261,9 @@ def run_night_runner(cfg: dict, goal: str, max_rounds: int = 20,
             log(f"夜间模式：免费发现失败（将靠下一轮自愈）: {e}")
 
     rounds = 0
+    # 基线：启动时所有活动的累计轮数。进度只算本次运行期间的增量，
+    # 否则历史活动的轮数会被误算成本夜进度、刚启动就触发轮数上限。
+    baseline = _count_new_rounds(load_state())
     interval = max(10, int(cfg.get("poll_interval", 30)))
     while True:
         now = datetime.now()
@@ -2243,10 +2275,10 @@ def run_night_runner(cfg: dict, goal: str, max_rounds: int = 20,
         except Exception as e:
             log(f"夜间模式单轮异常(已跳过): {e}")
             info = {}
-        done = _count_new_rounds(load_state())
+        done = _count_new_rounds(load_state()) - baseline
         if done > rounds:
             rounds = done
-            log(f"夜间进度: 已完成 {rounds} 轮迭代")
+            log(f"夜间进度: 本夜已完成 {rounds} 轮迭代")
         # 所有活动都暂停/结束 → 退出（安全原因暂停由人工复核后恢复）
         st = load_state()
         if not active_campaigns(st):
