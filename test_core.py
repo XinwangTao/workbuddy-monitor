@@ -1274,6 +1274,17 @@ check("降级后下一轮以兜底方向为本轮任务",
       _l_a == core.NEXT_STEP_FALLBACK and core.NEXT_STEP_FALLBACK in _p_a,
       f"label={_l_a!r}")
 
+# 兜底方向现在会真被执行成任务正文，只是一句「针对最明显的不足」式空话等于
+# 把方向又交还给模型自由发挥；必须点名到可核查的动作类别（动作 + 验收 + 汇报）。
+_fb = core.NEXT_STEP_FALLBACK
+check("兜底方向不再含「最明显/不足之处」式空话",
+      "最明显" not in _fb and "不足之处" not in _fb, f"实际={_fb!r}")
+check("兜底方向点名具体动作（补缺陷+补回归）",
+      ("补" in _fb and "回归" in _fb), f"实际={_fb!r}")
+check("兜底方向自带验收与汇报要求",
+      "跑通" in _fb and "汇报" in _fb and "通过" in _fb, f"实际={_fb!r}")
+check("兜底方向是祈使句（可执行而非描述）", _fb.rstrip().endswith(("。", "）", ")")))
+
 # 已有方向时，漏写标记不该把原有方向冲掉
 _ap_b = core.create_campaign(core.load_state(), "降级路径2", strategy="autopilot",
                              model="FreeA", max_iterations=0)
