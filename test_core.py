@@ -1283,6 +1283,24 @@ check("静默丢弃改记 warn（日志里能查到被拒原因）",
 core.set_campaign_status(core.load_state(), cnz["id"], "paused")
 sys.modules["workbuddy_cdp"] = _fake_cdp
 
+# 缓存回退那条路同样过闸：CDP 读不到时由接收方把回复写进 campaign_reply.txt，
+# 碎片照样可能从这儿进来，只堵 CDP 一条等于没堵。
+print("\n== 23c. 缓存回退路径：碎片同样被丢弃、正常回复照常放行 ==")
+_cache_file = _TMP / "campaign_reply_fragment.txt"
+_cfg_cache = cfg_of()
+_cfg_cache.setdefault("auto_send", {})["reply_cache_file"] = str(_cache_file)
+_ccamp = {"id": 7, "last_task_id": 7, "last_prompt": "项目目标：缓存回退自测"}
+FAKE["reply"] = None   # CDP 读不到 → 走缓存文件
+_cache_file.write_text("回车后消息并未真正进入对话的内容", encoding="utf-8")
+check("缓存里的碎片被丢弃（返回 None）",
+      core.try_capture_campaign_result(_ccamp, _cfg_cache) is None)
+check("缓存碎片被拒时写进日志（可定位到是哪条被拒）",
+      "回车后消息并未真正进入对话" in core.LOG_FILE.read_text(encoding="utf-8-sig"))
+_cache_file.write_text("已确认消息进入对话，回归跑通。", encoding="utf-8")
+check("缓存里的正常回复照常放行（闸不能误杀回退路径）",
+      core.try_capture_campaign_result(_ccamp, _cfg_cache) == "已确认消息进入对话，回归跑通。")
+_cache_file.unlink(missing_ok=True)
+
 # ================================================================ 24. autopilot：模型自主决定下一步方向
 print("\n== 24. autopilot（方向由 WorkBuddy 自己决定）==")
 check("autopilot 已注册为合法策略", "autopilot" in core.ITER_STRATEGIES)
