@@ -210,15 +210,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File create_shortcut.ps1
 | `auto_send.balance_guard` | 发送后余额减少立即暂停并弹窗报警（默认 `true`） |
 | `auto_send.free_catalog_max_age` | 免费模型目录保鲜期（秒，默认 21600=6 小时）；过期一律暂停发送 |
 
-## 🧪 运行测试
-
-无需真实 WorkBuddy 即可验证全部核心逻辑（CDP 用伪造模块注入，状态写入临时目录，不污染仓库）：
-
-```bash
-python test_core.py          # 核心逻辑离线测试（265 项：fail-closed 门控、倍率解析、回复捕获、
-                             # 输入框焦点校验、autopilot 模型自定方向、回复清洗、并发写保护等）
-
-## 迭代策略
+## 🔁 迭代策略
 
 | 策略 | 说明 | 适用 |
 |------|------|------|
@@ -226,50 +218,13 @@ python test_core.py          # 核心逻辑离线测试（265 项：fail-closed 
 | `improve` / `reflect` | 单一提示词反复迭代 / 每轮带反思 | 简单打磨、回归巡检 |
 | `autopilot` | **模型自定方向**：每轮回复末尾输出 `[[NEXT]]下一步任务[[/NEXT]]`，程序解析后作为下一轮提示词；连续 3 轮漏写自动暂停 | 让免费模型自己规划迭代路径 |
 
-## 发送可靠性（实测教训沉淀）
+## 🛡️ 发送可靠性（实测教训沉淀）
 
 - **输入框聚焦**：激活窗口 ≠ 焦点在编辑器。发送前用 CDP `focus_editor()` 直接把光标放回输入框；
 - **新建会话隔离**：发送前点「新建任务」回空会话，避免消息粘进历史会话并**沿用其计费模型**（实测 Hy3 被会话覆盖成 Deepseek-V4.1-Flash 白扣 9.17 积分）；
 - **新会话重选模型**：模型是会话级设置，新建后必须重新选择任务指定模型；
 - **双重粘贴校验**：粘贴后必须看到内容、回车后必须清空，任一失败任务回到 pending 重试，绝不静默丢消息；
 - **窗口激活多重降级**：ALT 键解除前台锁定 → AttachThreadInput 共享输入状态 → 全失败则取消发送。
-
-## 快速开始
-
-双击桌面快捷方式「WorkBuddy + 用量监控」，或：
-
-```powershell
-.\start_workbuddy.ps1    # 自检 CDP → 启动 WorkBuddy（CDP 9223）→ 启动监控 GUI
-```
-python test_e2e_real.py      # 实测：无 CDP 时回退/免费门控/白天不发送
-python test_e2e_cdp.py       # 实测：注入 Fake CDP 的「夜间 hy4 免费」自动迭代闭环
-python test_e2e_hy3_day.py   # 实测：白天 hy3 免费自动迭代闭环（按模型专属时段自动选模型）
-python test_gui_smoke.py     # GUI 构建冒烟（15 项，需带 tkinter 的 Python；无 tkinter 时自动跳过）
-```
-
-一键跑全部（与 CI 同款）：
-
-```bash
-python test_core.py && python test_e2e_real.py && python test_e2e_cdp.py && python test_e2e_hy3_day.py \
-  && python test_gui_smoke.py \
-  && python -m py_compile workbuddy_monitor.py workbuddy_cdp.py workbuddy_gui.py && echo "ALL OK"
-```
-
-**免费判定**部分是安全关键——宁可漏判（任务继续排队），也绝不把付费模型误判成免费，否则会真扣积分。
-测试里专门覆盖了这类误判边界：`x0.5`（半价）不能被当成 `x0`，`避免限流` / `免疫` 不能因为含「免」被当成免费，`MiniMax-M30.25x` 不能被解析成倍率 30.25。
-
-**实测通过的真实验证**（2026-09-24，免费模型 Hy3，账户余额 6605.47）：
-
-| 验证项 | 结果 |
-| --- | --- |
-| 免费门控 | `free_gate_reason("Hy3") == ""` 放行；`Hy4 preview`/`GLM-5.2`/`Deepseek-V4-Pro` 一律拦下 |
-| 真实发送 | CDP 切到 Hy3 → 粘贴 → 回车，2 轮全部发送成功 |
-| 积分消耗 | 6605.47 → 6605.47，**零扣费** |
-| 回复捕获 | 从 `.cr-agent__content` 读到真实回复，自动剥掉「共消耗 / 模型名 / 时间」元数据，排除首页无障碍文案与「深度思考」折叠块；并且**只认「本轮提示词之后」那条助手消息**，匹配不到就判定读不到回复（绝不拿别的会话/上一轮的内容冒充本轮产出） |
-| 会话定位 | 发送后回到会话列表，能按 `last_prompt` 前缀定位回刚才那条会话 |
-| 迭代闭环 | 第 1 轮回复「链路正常」→ 推进 → 生成第 2 轮（引用上轮结果）→ 再发 → 达到 max=2 自动结束 |
-
-> 会话定位很重要：WorkBuddy 发送消息后会回到**会话列表页**，读不到 `.cr-agent__content` 就会把别的会话内容当成本轮产出。若拿不到回复，宁可判定「未完成」也绝不用 UI 噪声推进迭代。
 
 ## 📁 文件结构
 
@@ -289,6 +244,30 @@ python test_core.py && python test_e2e_real.py && python test_e2e_cdp.py && pyth
 ```
 
 运行时自动生成（已 gitignore）：`config.json`、`state.json`、`monitor.log`
+
+## 🧪 运行测试
+
+无需真实 WorkBuddy 即可验证全部核心逻辑（CDP 用伪造模块注入，状态写入临时目录，不污染仓库）：
+
+```bash
+python test_core.py          # 核心逻辑离线测试（265 项：fail-closed 门控、倍率解析、回复捕获、
+                             #   输入框焦点校验、autopilot 模型自定方向、回复清洗、并发写保护等）
+python test_e2e_real.py      # 实测：无 CDP 时回退/免费门控/白天不发送
+python test_e2e_cdp.py       # 实测：注入 Fake CDP 的「夜间 hy4 免费」自动迭代闭环
+python test_e2e_hy3_day.py   # 实测：白天 hy3 免费自动迭代闭环（按模型专属时段自动选模型）
+python test_gui_smoke.py     # GUI 构建冒烟（15 项，需带 tkinter 的 Python；无 tkinter 时自动跳过）
+```
+
+一键跑全部（与 CI 同款）：
+
+```bash
+python test_core.py && python test_e2e_real.py && python test_e2e_cdp.py && python test_e2e_hy3_day.py \
+  && python test_gui_smoke.py \
+  && python -m py_compile workbuddy_monitor.py workbuddy_cdp.py workbuddy_gui.py && echo "ALL OK"
+```
+
+**免费判定**是安全关键——宁可漏判（任务继续排队），也绝不把付费模型误判成免费，否则会真扣积分。
+测试里专门覆盖了这类误判边界：`x0.5`（半价）不能被当成 `x0`，`避免限流` / `免疫` 不能因为含「免」被当成免费，`MiniMax-M30.25x` 不能被解析成倍率 30.25。
 
 ## 🤝 贡献
 

@@ -58,7 +58,7 @@ core.STATE_FILE = TMP / "state.json"
 core.CONFIG_FILE = TMP / "config.json"
 core.LOG_FILE = TMP / "monitor.log"
 # 真实窗口发送无法在无窗口时执行，mock 为成功（其余路径真实）
-core.auto_send_to_workbuddy = lambda content, title=None: (True, "mocked-send")
+core.auto_send_to_workbuddy = lambda content, title=None, model="": (True, "mocked-send")
 
 cfg = core.load_config()
 # 模拟免费时段：临时把免费窗口设为覆盖当前时间（真实场景即夜里 23:00-08:00）
