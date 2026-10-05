@@ -938,3 +938,50 @@ def focus_editor() -> bool:
 def is_workbuddy_running():
     """WorkBuddy 是否在运行且 CDP 可用"""
     return _find_page_target() is not None
+
+
+def clear_editor(needle: str = "") -> bool:
+    """清空输入框里残留的草稿（Enter 没提交成功、或注入落了一半时用）。
+
+    真实缺陷：旧代码只在回车后校验「输入框仍有内容」，判失败就直接返回，
+    草稿却还留在编辑器里。下一轮重试时新内容被追加到旧草稿之后，
+    一次发送变成「旧稿+新内容」拼起来的那条，幂等去重认不出来
+    （它查的是本轮内容的前 40 字，对话里出现的是拼接后的整条）。
+    消息照样进了会话，但内容已经不是要发的那条了。
+
+    needle 是这份草稿的头部特征（调用方传待发送内容前 40 字）：
+    只有它确实还在输入框里才动手，避免误删用户正在写的别的内容。
+    返回 True 表示残留已清掉（或本就不存在），False 表示没清掉。"""
+    t = _find_page_target()
+    if not t:
+        return False
+    if needle and not editor_contains(needle):
+        return True          # 输入框里没有这份草稿，本来就是干净的
+    try:
+        with _Cdp(t) as c:
+            r = c.call("Runtime.evaluate",
+                       {"expression": _JS_FOCUS_EDITOR,
+                        "returnByValue": True, "awaitPromise": True},
+                       timeout=10)
+            if r.get("result", {}).get("value") != "focused":
+                return False
+            c.call("Input.dispatchKeyEvent",
+                   {"type": "rawKeyDown", "key": "a", "code": "KeyA",
+                    "windowsVirtualKeyCode": 65, "nativeVirtualKeyCode": 65,
+                    "modifier": 2}, timeout=10)   # modifier=2 → Ctrl
+            c.call("Input.dispatchKeyEvent",
+                   {"type": "keyUp", "key": "a", "code": "KeyA",
+                    "windowsVirtualKeyCode": 65, "nativeVirtualKeyCode": 65,
+                    "modifier": 2}, timeout=10)
+            c.call("Input.dispatchKeyEvent",
+                   {"type": "keyDown", "key": "Backspace", "code": "Backspace",
+                    "windowsVirtualKeyCode": 8, "nativeVirtualKeyCode": 8,
+                    "text": ""}, timeout=10)
+            c.call("Input.dispatchKeyEvent",
+                   {"type": "keyUp", "key": "Backspace", "code": "Backspace",
+                    "windowsVirtualKeyCode": 8, "nativeVirtualKeyCode": 8},
+                   timeout=10)
+        time.sleep(0.2)
+        return not editor_contains(needle) if needle else True
+    except Exception:
+        return False

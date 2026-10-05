@@ -1619,6 +1619,188 @@ check("回归-消息确实在对话里→正常标 sent（不误杀）",
 core._enter = _orig_enter_b
 sys.modules["workbuddy_cdp"] = _saved_mod if _saved_mod else types.ModuleType("workbuddy_cdp")
 
+# ================================================================ 25c. 回车未提交→判失败且清掉残留草稿
+# 真实缺陷：回车没提交时草稿留在输入框里，旧代码只报「消息未提交」就返回，
+# 草稿不清掉；下一轮重试把新内容追加其后，发出去的是「旧稿+新内容」拼的那条，
+# 幂等去重认不出来（它查的是本轮内容前 40 字，对话里出现的是拼接后的整条）。
+print("\n== 25c. 回车未提交→判失败并清残留（防重试拼成「旧稿+新内容」）==")
+
+_left = {"editor": "", "clears": [], "at_submit": None, "enter_clears": True,
+         "convs": []}
+
+
+def _c_editor_contains(needle):
+    """模拟输入框：回车之后按 enter_clears 决定这次提交到底成没成。
+
+    返回值必须反映「输入框里现在还有没有这份内容」——一律返回 True 会让
+    「提交成功」也被判成失败（_editor_still_has_text 就永远为真）。"""
+    if not _enter_pressed["v"]:
+        # 注入/粘贴前的校验：新内容追加到输入框现有草稿之后（这正是被污染的来源）
+        _left["editor"] = (("\n" + _left["editor"]) if _left["editor"] else "") + needle
+        return True
+    _left["at_submit"] = _left["editor"]
+    if _left["enter_clears"] or needle not in _left["editor"]:
+        _left["editor"] = ""          # 消息真的进了对话，输入框清空
+        if needle not in _conv_seen:
+            _conv_seen.append(needle)  # 对话里这才出现本条用户消息
+        return False
+    return True                        # 回车没提交，草稿还留在框里
+
+
+def _c_read_conversation():
+    """对话内容必须「只有回车真提交之后才出现」。
+
+    若让它永远回显当前内容，发送前的幂等去重会在第一条就开始命中、
+    直接返回「已存在相同消息」——后续断言全是空过。"""
+    if not _conv_seen:
+        return []
+    return [{"role": "user", "text": t} for t in _conv_seen] + \
+        [{"role": "assistant", "text": "好的，已收到"}]
+
+
+def _c_clear_editor(needle=""):
+    _left["clears"].append(needle)
+    _left["editor"] = ""
+    return True
+
+
+class _EdStuck(_EdCDP):
+    editor_contains = staticmethod(_c_editor_contains)
+    clear_editor = staticmethod(_c_clear_editor)
+    _in_conversation_page = staticmethod(lambda: True)
+    read_conversation = staticmethod(_c_read_conversation)
+    _open_conversation_by_title = staticmethod(lambda kw: False)
+
+
+_conv_seen = []                # 对话里已经出现的用户消息（回车提交成功才追加）
+_orig_enter_c = core._enter
+
+
+def _enter_and_mark_c():
+    _enter_pressed["v"] = True
+    _orig_enter_c()
+
+
+core._enter = _enter_and_mark_c
+
+# --- 首轮：回车没提交（草稿留在编辑器里）→ 必须判失败，且把残留清掉 ---
+sys.modules["workbuddy_cdp"] = _EdStuck
+_enter_pressed["v"] = False
+_left["clears"] = []
+_left["at_submit"] = None
+_left["enter_clears"] = False             # 这一轮回车故意提交不出去
+_left["editor"] = "降级路径内容"          # 上一轮留下的草稿
+_st["model_catalog"] = [{"name": "FreeA", "free": True, "multiplier": 0.0}]
+core.save_state(_st)
+_t_stuck = {"id": 53, "content": "降级路径内容", "model": "FreeA",
+            "allow_credit": False, "status": "pending", "attempts": 0}
+try:
+    core.send_task(_t_stuck, cfg_send)
+except Exception as e:
+    print("  (send raised:", e, ")")
+check("回车未提交→不标 sent（防静默丢消息）",
+      _t_stuck.get("status") != "sent", f"实际={_t_stuck.get('status')}")
+check("回车未提交→确实走了清稿分支",
+      len(_left["clears"]) == 1, f"清稿调用={_left['clears']!r}")
+check("清稿传的是本轮内容前 40 字",
+      _left["clears"] and _left["clears"][0] == _t_stuck["content"][:40],
+      f"实际={_left['clears']!r}")
+check("清稿后输入框恢复干净（重试从空框开始）",
+      _left["editor"] == "", f"残留={_left['editor']!r}")
+check("不清稿就会把旧稿+新内容拼着发出去（隐患实锤）",
+      _left["at_submit"] is not None and _left["at_submit"].count("降级路径内容") == 2,
+      f"回车时编辑器={_left['at_submit']!r}")
+
+# --- 重试：草稿已清 + 这次回车提交成功 → 进对话的必须是完整单条，不掺旧稿 ---
+_enter_pressed["v"] = False
+_left["editor"] = ""                       # 上一轮失败后已清空
+_left["enter_clears"] = True               # 这次回车真的提交了
+_left["at_submit"] = None
+_t_retry = {"id": 54, "content": "重试后应当完整发出去的内容", "model": "FreeA",
+            "allow_credit": False, "status": "pending", "attempts": 0}
+try:
+    core.send_task(_t_retry, cfg_send)
+except Exception as e:
+    print("  (send raised:", e, ")")
+check("清稿后重试能正常发送成功", _t_retry.get("status") == "sent",
+      f"实际={_t_retry.get('status')}")
+check("重试发出的是完整单条，没掺上轮残留",
+      _left["at_submit"] == _t_retry["content"],
+      f"回车时编辑器={_left['at_submit']!r}")
+
+# --- 正常发送（回车成功、输入框清空）不得误清别的内容 ---
+_left["clears"] = []
+_left["at_submit"] = None
+_enter_pressed["v"] = False
+_left["editor"] = ""
+_t_ok2 = {"id": 55, "content": "正常发送时不该动输入框", "model": "FreeA",
+          "allow_credit": False, "status": "pending", "attempts": 0}
+try:
+    core.send_task(_t_ok2, cfg_send)
+except Exception as e:
+    print("  (send raised:", e, ")")
+check("正常发送成功", _t_ok2.get("status") == "sent", f"实际={_t_ok2.get('status')}")
+check("提交成功时不清稿（不会误删）", _left["clears"] == [],
+      f"清稿调用={_left['clears']!r}")
+
+core._enter = _orig_enter_c
+sys.modules["workbuddy_cdp"] = _saved_mod if _saved_mod else types.ModuleType("workbuddy_cdp")
+
+# --- 清稿 helper 本身的边界：CDP 不在线 / CDP 抛错都不能把发送流程带崩 ---
+_cls = {"runs": 0, "ok": True}
+
+
+class _ClsCDP:
+    is_workbuddy_running = staticmethod(lambda: True)
+    clear_editor = staticmethod(
+        lambda needle="": (_cls.__setitem__("runs", _cls["runs"] + 1) or _cls["ok"]))
+
+
+sys.modules["workbuddy_cdp"] = _ClsCDP
+check("_clear_editor_leftover 清掉残留返回 True",
+      core._clear_editor_leftover("任意内容前40字") is True)
+check("清稿时把截取后的特征字传给 CDP", _cls["runs"] == 1)
+_cls["runs"] = 0
+_cls["ok"] = False
+check("_clear_editor_leftover 清不掉时返回 False（不谎报清干净）",
+      core._clear_editor_leftover("任意内容前40字") is False)
+_cls["ok"] = True
+
+
+class _ClsDown:
+    is_workbuddy_running = staticmethod(lambda: False)
+    clear_editor = staticmethod(lambda needle="": True)
+
+
+sys.modules["workbuddy_cdp"] = _ClsDown
+_cls["runs"] = 0                          # 复位：上一条用例已累加过一次
+check("CDP 不在线时不清稿（避免误删）且返回 False",
+      core._clear_editor_leftover("任意内容前40字") is False and _cls["runs"] == 0,
+      f"runs={_cls['runs']}")
+
+
+class _ClsBoom:
+    is_workbuddy_running = staticmethod(lambda: True)
+
+    @staticmethod
+    def clear_editor(needle=""):
+        raise RuntimeError("CDP 崩了")
+
+
+sys.modules["workbuddy_cdp"] = _ClsBoom
+try:
+    core._clear_editor_leftover("任意内容前40字")
+    _boom_ok = True
+except Exception as e:
+    _boom_ok = False
+    print("  (raised:", e, ")")
+check("CDP 清稿异常被吞掉，不把发送流程带崩", _boom_ok)
+sys.modules["workbuddy_cdp"] = _saved_mod if _saved_mod else types.ModuleType("workbuddy_cdp")
+
+# 真实 CDP 层确实提供了这个函数（不是只写在 monitor 侧的空壳）
+check("workbuddy_cdp 提供 clear_editor（CDP 层真实现）",
+      callable(getattr(cdp, "clear_editor", None)))
+
 # ================================================================ 26. 回复清洗：剥掉「深度思考」标题
 print("\n== 26. 回复清洗剥掉「深度思考」折叠标题 ==")
 _t1_in = "深度思考\n收到测试消息。"

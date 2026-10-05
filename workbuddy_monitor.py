@@ -1882,9 +1882,13 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
     # 还原用户剪贴板
     if prev_clip:
         set_clipboard_text(prev_clip)
-    # 发送后确认：输入框应被清空（消息已提交）
+    # 发送后确认：输入框应被清空（消息已提交）。
+    # 真实缺陷：回车没提交时草稿留在编辑器里，只报失败不清掉的话，下一轮重试会
+    # 把新内容追加到旧草稿之后，发出去的是「旧稿+新内容」拼的那条，且幂等去重
+    # 认不出来（它查的是本轮内容前 40 字，而对话里出现的是拼接后的整条）。
     if _editor_still_has_text(content):
-        return False, "回车后输入框仍有内容（消息未提交），已保留任务待重试"
+        _clear_editor_leftover(content)
+        return False, "回车后输入框仍有内容（消息未提交），已清空残留草稿并保留任务待重试"
     # 真实投递校验：消息必须真的出现在对话里，否则只是“假成功”
     # （粘贴/提交可能静默失败，仅看输入框清空会误判为已发送）。
     if not _sent_message_present_in_conversation(content):
@@ -1957,6 +1961,20 @@ def _editor_still_has_text(needle: str) -> bool:
             return False
         head = (needle or "").strip()[:40]
         return bool(head) and bool(workbuddy_cdp.editor_contains(head))
+    except Exception:
+        return False
+
+
+def _clear_editor_leftover(needle: str) -> bool:
+    """清掉回车没提交、残留在输入框里的我方草稿。
+
+    只在「确实还看得到这份草稿」时才动手，避免误删用户正在写的别的内容。
+    返回 True 表示残留已清掉（或本就不存在），False 表示没清掉。"""
+    try:
+        import workbuddy_cdp
+        if not workbuddy_cdp.is_workbuddy_running():
+            return False
+        return bool(workbuddy_cdp.clear_editor((needle or "").strip()[:40]))
     except Exception:
         return False
 
