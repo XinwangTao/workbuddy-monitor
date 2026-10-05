@@ -795,6 +795,76 @@ check("log_heartbeat 不抛异常", ok_hb)
 _heart = core.LOG_FILE.read_text(encoding="utf-8-sig")
 check("心跳已写入日志文件", "监控心跳" in _heart)
 
+# ---- 心跳文案（第2轮改版）：一句话「结论 + 证据」，钉住不再退回管道式字段流
+def _hb():
+    """取日志里最新一条心跳原文"""
+    txt = core.LOG_FILE.read_text(encoding="utf-8-sig")
+    lines = [ln for ln in txt.splitlines() if "监控心跳" in ln]
+    return lines[-1] if lines else ""
+
+
+def _mk_campaign(state, **kw):
+    state.setdefault("campaigns", []).append(
+        {"id": "c1", "status": "running", "current_iteration": 3, **kw})
+    core.ensure_campaigns(state)
+
+
+def _ago(now, sec):
+    """相对「心跳时刻」回溯 sec 秒的 awaiting_result_at（不能用真实当前时间，
+    否则 now 传 t_at(2) 时时间戳会落在 now 之后，卡住判定算成负时长）"""
+    return (now - timedelta(seconds=sec)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# 空转：窗口开着却没活可推，不能写成"待机守夜"（两者含义不同）
+s_idle = fresh_state(); stamp(s_idle)
+core.log_heartbeat(s_idle, cfg2, t_at(2))
+_h = _hb()
+check("心跳·空转 结论前置", "监控心跳·空转：窗口开着，但没活可推" in _h, f"实际={_h}")
+check("心跳·空转 是同一句话（无管道分隔）", "|" not in _h, f"实际={_h}")
+check("心跳·空转 句号收尾", _h.rstrip().endswith("。"), f"实际={_h}")
+
+# 在跑
+t_now = t_at(2)
+s_run = fresh_state(); stamp(s_run)
+_mk_campaign(s_run, awaiting_result=True, awaiting_result_at=_ago(t_now, 10))
+core.log_heartbeat(s_run, cfg2, t_now)
+_h = _hb()
+check("心跳·在跑 结论前置", "监控心跳·在跑：正在推进" in _h, f"实际={_h}")
+check("心跳·在跑 带轮次+距上次动作", "第 3 轮" in _h and "上次动作" in _h, f"实际={_h}")
+
+# 卡住：在途超时，必须点名是哪条活动僵了
+t_now = t_at(2)
+s_stuck = fresh_state(); stamp(s_stuck)
+_mk_campaign(s_stuck, awaiting_result=True, awaiting_result_at=_ago(t_now, 2000))
+core.log_heartbeat(s_stuck, cfg2, t_now)
+_h = _hb()
+check("心跳·卡住 结论前置", "监控心跳·卡住(在途超时)：在途回复超等待上限" in _h, f"实际={_h}")
+check("心跳·卡住 点名活动+超时秒数", "#c1" in _h and "超 1800s" in _h, f"实际={_h}")
+check("心跳·卡住 不重复报「上次动作」", "上次动作" not in _h, f"实际={_h}")
+
+# 被拦：余额守卫
+s_g = fresh_state(); stamp(s_g)
+core.set_balance_guard_paused(s_g, True, "余额不足")
+core.log_heartbeat(s_g, cfg2, t_at(2))
+_h = _hb()
+check("心跳·被拦 结论前置",
+      "监控心跳·被拦(余额守卫)：被余额守卫拦住了，不推任务" in _h, f"实际={_h}")
+
+# 待机：窗口外活动在途，不能误报"卡住"（白天本就不该推进）
+t_now = t_at(14)
+s_wait = fresh_state(); stamp(s_wait)
+_mk_campaign(s_wait, awaiting_result=True, awaiting_result_at=_ago(t_now, 2000))
+core.log_heartbeat(s_wait, cfg2, t_now)
+_h = _hb()
+check("心跳·窗口外判待机而非卡住", "待机" in _h and "卡住" not in _h, f"实际={_h}")
+
+# 待发任务数
+s_pend = fresh_state(); stamp(s_pend)
+core.add_task(s_pend, "待发任务A", model="FreeA")
+core.log_heartbeat(s_pend, cfg2, t_at(2))
+_h = _hb()
+check("心跳·带待发任务数", "待发 1 条任务" in _h, f"实际={_h}")
+
 # ================================================================ 18. 并发写保护
 print("\n== 18. state.json 并发写保护 ==")
 import threading as _th
