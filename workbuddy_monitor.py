@@ -353,7 +353,9 @@ def log_heartbeat(state: dict, cfg: dict, now=None):
     c = (stuck or {}).get("c") or (active[0] if active else None)
     if c:
         it = int(c.get("current_iteration", 0) or 0)
-        if stuck:
+        if tag == "卡住(在途超时)":
+            # 用 tag 而不是 stuck 是否非空来选措辞：窗口外会先判成"待机"，
+            # 那时 in-flight 已超时属正常，再报"（超 1800s）"就自己打自己脸。
             elapsed = _fmt_dur((now - stuck["t"]).total_seconds())
             seg_camp = f"；迭代 #{c['id']} 第{it}轮在途回复已等 {elapsed}（超 {await_timeout}s）"
         elif paused:
@@ -1748,10 +1750,10 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
         if _cdp_dedup.is_workbuddy_running() and \
                 hasattr(_cdp_dedup, "read_conversation"):
             conv = _cdp_dedup.read_conversation()  # 读不到对话→无法证实，不做去重
-            head_d = (content or "").strip()[:40]
+            head_d = _norm_ws(content or "")[:40]
             if (conv and head_d
                     and any(m.get("role") == "user"
-                            and head_d in (m.get("text") or "") for m in conv)):
+                            and head_d in _norm_ws(m.get("text") or "") for m in conv)):
                 log("发现相同消息已存在于当前会话中（幂等去重），不再重复发送")
                 return True, "已存在相同消息，按已发送处理（幂等去重）"
     except Exception:
@@ -1843,6 +1845,12 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
     return True, "已自动粘贴并发送到 WorkBuddy"
 
 
+def _norm_ws(s: str) -> str:
+    """归一化用于匹配：去掉所有空白/零宽字符/BOM（WorkBuddy 气泡里实测
+    会混入 \ufeff 和多余换行，原样前缀匹配会漏判）。"""
+    return re.sub(r"[\s\ufeff\u200b]+", "", s or "")
+
+
 def _sent_message_present_in_conversation(content: str, tries: int = 6) -> bool:
     """发送后确认消息确实进入了对话（存在含该内容的用户气泡）。
 
@@ -1857,7 +1865,7 @@ def _sent_message_present_in_conversation(content: str, tries: int = 6) -> bool:
         return True
     if not hasattr(workbuddy_cdp, "read_conversation"):
         return True  # 离线测试桩无 CDP 能力，保守放行
-    head = (content or "").strip()[:40]
+    head = _norm_ws(content or "")[:40]
     if not head:
         return True
     for attempt in range(max(1, tries)):
@@ -1876,7 +1884,7 @@ def _sent_message_present_in_conversation(content: str, tries: int = 6) -> bool:
         except Exception:
             conv = None
         if conv and any(m.get("role") == "user"
-                       and head in (m.get("text") or "") for m in conv):
+                       and head in _norm_ws(m.get("text") or "") for m in conv):
             return True
         # 兜底：按内容前缀定位到刚发的那条会话再确认一次
         try:
@@ -1886,7 +1894,7 @@ def _sent_message_present_in_conversation(content: str, tries: int = 6) -> bool:
                     if workbuddy_cdp._in_conversation_page():
                         conv = workbuddy_cdp.read_conversation()
                         if conv and any(m.get("role") == "user"
-                                       and head in (m.get("text") or "") for m in conv):
+                                       and head in _norm_ws(m.get("text") or "") for m in conv):
                             return True
         except Exception:
             pass
