@@ -1339,8 +1339,12 @@ def advance_campaign(camp, result, state):
             log(f"迭代活动 #{camp['id']} 模型自定下一步方向: {step[:80]}")
         else:
             camp["next_step_missing"] = camp.get("next_step_missing", 0) + 1
+            # 关键：兜底方向必须真的落进 camp，否则下一条「本轮默认方向」无处可依，
+            # 日志喊着"将使用兜底方向续跑"、实际下一轮还是零方向裸跑。
+            if not camp.get("next_step"):
+                camp["next_step"] = NEXT_STEP_FALLBACK
             log(f"迭代活动 #{camp['id']} 本轮未给出下一步方向({why})，"
-                f"连续 {camp['next_step_missing']} 次；将使用兜底方向续跑")
+                f"连续 {camp['next_step_missing']} 次；已切到兜底方向续跑")
     stages = camp.get("stages") or _IMPROVE_ANGLES
     camp["stage_index"] = (camp["stage_index"] + 1) % max(1, len(stages))
     camp["awaiting_result"] = False

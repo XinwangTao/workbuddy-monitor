@@ -1258,6 +1258,32 @@ check("漏写标记返回 no-marker", core.extract_next_step("没有任何标记
 check("空方向返回 too-short", core.extract_next_step("[[NEXT]][[/NEXT]]")[0] is None)
 check("空文本返回 empty", core.extract_next_step("") == (None, "empty"))
 
+# 降级路径：漏写标记后兜底方向必须真的落进 camp，并成为下一轮任务，
+# 否则日志喊"将使用兜底方向续跑"、下一轮仍是零方向裸跑。
+_ap_a = core.create_campaign(core.load_state(), "降级路径", strategy="autopilot",
+                             model="FreeA", max_iterations=0)
+core.advance_campaign(_ap_a, "这一轮没写任何 [[NEXT]] 标记", core.load_state())
+_ap_a = core.campaign_by_id(core.load_state(), _ap_a["id"])
+check("漏写标记→兜底方向落到 next_step",
+      _ap_a.get("next_step") == core.NEXT_STEP_FALLBACK,
+      f"实际={_ap_a.get('next_step')!r}")
+check("漏写标记→漏写计数累计", _ap_a.get("next_step_missing") == 1,
+      f"实际={_ap_a.get('next_step_missing')}")
+_p_a, _l_a = core.generate_next_prompt(_ap_a, core.load_state())
+check("降级后下一轮以兜底方向为本轮任务",
+      _l_a == core.NEXT_STEP_FALLBACK and core.NEXT_STEP_FALLBACK in _p_a,
+      f"label={_l_a!r}")
+
+# 已有方向时，漏写标记不该把原有方向冲掉
+_ap_b = core.create_campaign(core.load_state(), "降级路径2", strategy="autopilot",
+                             model="FreeA", max_iterations=0)
+_ap_b["next_step"] = "给 parser 补边界测试"
+core.advance_campaign(_ap_b, "又漏写了 [[NEXT]]", core.load_state())
+_ap_b = core.campaign_by_id(core.load_state(), _ap_b["id"])
+check("已有方向时降级不覆盖原方向",
+      _ap_b.get("next_step") == "给 parser 补边界测试",
+      f"实际={_ap_b.get('next_step')!r}")
+
 # 推进时方向被存进 next_step
 _ap2 = core.create_campaign(core.load_state(), "autopilot2", strategy="autopilot",
                             model="FreeA", max_iterations=0)
