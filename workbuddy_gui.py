@@ -4,6 +4,7 @@ WorkBuddy 监控 - 可视化任务管理界面（响应式布局版）
 运行: pythonw workbuddy_gui.py
 """
 import sys
+import argparse
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -17,6 +18,35 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 import workbuddy_monitor as core
+
+
+def _refresh_mon_label(app, info=None):
+    """在监控线程里安全地更新监控状态标签（经 Tk 主线程队列转发）。
+
+    除了"监控中"，还显示当前是否在免费时段——这是判断"昨晚为什么没跑"最直观的位置。"""
+    def _apply():
+        try:
+            if not getattr(app, "monitoring", False):
+                return
+            if info is None:
+                return
+            if info.get("guard_paused"):
+                app.lbl_mon.config(text="🟢 监控中…（余额守卫暂停发送）", foreground="#B8860B")
+            elif info.get("in_free_window"):
+                app.lbl_mon.config(text="🟢 监控中…（免费时段内）", foreground="green")
+            else:
+                w = core.effective_free_window(app.state, None, app.cfg)
+                nxt = core.next_free_window(app.cfg, app.state)
+                nxt_s = nxt.strftime("%m-%d %H:%M") if nxt else w.get("start", "23:00")
+                app.lbl_mon.config(
+                    text=f"🟢 监控中…（等免费时段 {w.get('start')}-{w.get('end')}，下次 {nxt_s}）",
+                    foreground="#B8860B")
+        except Exception:
+            pass
+    try:
+        app.root.after(0, _apply)
+    except Exception:
+        pass
 
 
 class App:
@@ -211,11 +241,8 @@ class App:
     def refresh_free(self):
         state = self.state
         cat = state.get("model_catalog") or []
-        fi = state.get("free_info", {}).get("window")
-        if fi:
-            win = f"{fi.get('start')}-{fi.get('end')}（来源:{fi.get('source','?')}）"
-        else:
-            win = "23:00-08:00（默认/政策）"
+        w = core.effective_free_window(state, None, self.cfg)
+        win = f"{w.get('start')}-{w.get('end')}（来源:{w.get('source', '?')}）"
         free_models = [c["name"] for c in cat if c.get("free")]
         if free_models:
             self.lbl_free.config(
@@ -243,9 +270,18 @@ class App:
                 text=f"自动迭代: 共 {len(camps)} 个活动（{done} 个已完成）",
                 foreground="#888")
 
-    def refresh_tasks(self):
+    def refresh_tasks(self, force: bool = False):
+        """刷新任务列表。默认增量更新：仅当可见内容变化时才动 Treeview，
+        避免 2 秒一次的定时同步把列表整表删除重建造成闪烁与输入抢焦点。"""
+        tasks = self.state.get("tasks", [])
+        key = tuple((t.get("id"), t.get("status"), t.get("model"), t.get("content"),
+                     t.get("created", ""), t.get("scheduled_time"),
+                     (t.get("last_error") or "")[:20]) for t in tasks)
+        if not force and getattr(self, "_tasks_key", None) == key:
+            return
+        self._tasks_key = key
         self.tree.delete(*self.tree.get_children())
-        for t in self.state.get("tasks", []):
+        for t in tasks:
             st = t.get("status", "pending")
             tag = {"sent": "sent", "failed": "failed"}.get(st, "pending")
             mark = {"sent": "✅已发送", "failed": "❌发送失败"}.get(st, "⏳等待中")
@@ -257,17 +293,54 @@ class App:
                              tags=(tag,))
 
     def _save(self):
-        core.save_state(self.state)
+        """把当前内存状态合并回磁盘（按 id 逐条合并，不清掉别人的新增）。"""
+        self._merge_save()
+
+    def _merge_save(self):
+        """并发安全的保存：以磁盘最新状态为基准，仅在内存里被修改过的记录上覆盖，
+        避免 GUI 用旧快照整体写盘而丢掉监控线程/GUI 其他窗口的更新。"""
+        try:
+            with core.state_lock():
+                fresh = core.load_state()
+                for t in self.state.get("tasks", []):
+                    for i, ft in enumerate(fresh.get("tasks", [])):
+                        if ft.get("id") == t.get("id"):
+                            fresh["tasks"][i] = t
+                            break
+                    else:
+                        fresh.setdefault("tasks", []).append(t)
+                for key in ("rate_limits", "free_info", "balance_guard", "model_catalog"):
+                    if self.state.get(key):
+                        fresh[key] = self.state[key]
+                core.save_state(fresh)
+                self.state = fresh
+            return True
+        except Exception as e:  # noqa: BLE001
+            core.log(f"GUI 合并保存失败: {e}")
+            return False
+
+    def _state_fingerprint(self):
+        """用 state.json 的 mtime+size 判断是否有外部写入，避免无谓的读盘与全量刷新。"""
+        try:
+            st = core.STATE_FILE.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except Exception:
+            return None
 
     def _auto_sync(self):
         """UI 主线程定时从磁盘同步状态，界面永远显示最新数据"""
         try:
-            self.state = core.load_state()
-            self.refresh_all()
+            fp = self._state_fingerprint()
+            if fp is not None and getattr(self, "_state_fp", None) == fp:
+                pass  # 磁盘没变：跳过读盘与界面重建（省 CPU，也不打断用户操作）
+            else:
+                self._state_fp = fp
+                self.state = core.load_state()
+                self.refresh_all()
             if core.balance_guard_paused(self.state):
                 self.lbl_guard.config(text="⛔ 余额守卫：自动发送已暂停", foreground="red")
             elif not core.in_free_window(self.cfg, self.state):
-                win = core.effective_free_window(self.state)
+                win = core.effective_free_window(self.state, None, self.cfg)
                 nxt = core.next_free_window(self.cfg, self.state)
                 nxt_s = nxt.strftime("%H:%M") if nxt else win.get("start", "23:00")
                 self.lbl_guard.config(text=f"⏳ 等待免费时段 {win['start']}-{win['end']}（{nxt_s} 后开始）",
@@ -319,15 +392,16 @@ class App:
         if not task:
             return
         # 从磁盘最新状态合并写回，并清空失败计数，让自动发送可以再次尝试
-        fresh = core.load_state()
-        for t in fresh.get("tasks", []):
-            if t.get("id") == task["id"]:
-                t["status"] = "pending"
-                t["attempts"] = 0
-                t.pop("last_error", None)
-                break
-        core.save_state(fresh)
-        self.state = fresh
+        with core.state_lock():
+            fresh = core.load_state()
+            for t in fresh.get("tasks", []):
+                if t.get("id") == task["id"]:
+                    t["status"] = "pending"
+                    t["attempts"] = 0
+                    t.pop("last_error", None)
+                    break
+            core.save_state(fresh)
+            self.state = fresh
         self.refresh_tasks()
 
     def on_edit(self):
@@ -582,8 +656,10 @@ class App:
         opt.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
         ttk.Label(opt, text="策略:").grid(row=0, column=0, padx=(0, 2))
         cmb_strat = ttk.Combobox(opt, width=12, values=list(core.ITER_STRATEGIES), state="readonly")
-        cmb_strat.set("improve")
+        cmb_strat.set("autopilot")
         cmb_strat.grid(row=0, column=1, padx=4)
+        ttk.Label(opt, text="selfdrive=模型自己决定下一步方向", foreground="#666").grid(
+            row=0, column=6, padx=(8, 0))
         ttk.Label(opt, text="最大轮数(0=∞):").grid(row=0, column=2, padx=(8, 2))
         ent_max = ttk.Entry(opt, width=6)
         ent_max.insert(0, "0")
@@ -736,42 +812,42 @@ class App:
             self.lbl_mon.config(text="🟢 监控中…", foreground="green")
 
     def _monitor_loop(self):
+        """后台监控线程：与 CLI 共用 core.monitor_tick，保证两条链路行为一致。"""
         try:
             interval = max(5, int(float(self.cfg.get("poll_interval", 30))))
         except (TypeError, ValueError):
             interval = 30
-        # 启动时从 WorkBuddy 底层发现免费模型/时段（失败仅记录）
+        # 启动时从 WorkBuddy 底层发现免费模型/时段 + 自检（失败仅记录）
         try:
             core.discover_free_models(self.cfg, self.state)
             core.discover_free_window(self.cfg, self.state)
         except Exception as e:
             core.log(f"初始免费发现失败(可忽略): {e}")
+        try:
+            core.startup_selfcheck(self.cfg, self.state)
+        except Exception as e:
+            core.log(f"启动自检失败(可忽略): {e}")
+        _hb_at = [0.0]
+        _err_streak = [0]
         while not self._mon_stop.is_set():
             try:
-                # 每轮从磁盘读最新状态，避免与 UI/CLI 写入冲突
-                state = core.load_state()
-                self.state = state
-                # 余额守卫暂停中：跳过自动发送，但仍更新限流检测
-                if core.balance_guard_paused(state):
-                    self._mon_stop.wait(interval)
-                    continue
-                core.check_rate_limits(state, self.cfg)
-                now = datetime.now()
-                # 统一调度：遍历所有 pending 任务，到达发送条件即发送。
-                # 条件：① 限流重置已到 ② 免费模型在免费时段 ③ 用户指定时间已到
-                for t in core.pending_tasks(state):
-                    if core.task_sendable_now(t, state, self.cfg, now):
-                        # 双重保险：发送前从磁盘确认仍是 pending（可能已被其他进程发送）
-                        fresh = core.load_state()
-                        still = next((x for x in fresh.get("tasks", [])
-                                      if x.get("id") == t.get("id") and x.get("status") == "pending"), None)
-                        if still:
-                            core.send_task(t, self.cfg)
-                # 自动迭代：仅在免费时段内推进
-                if core.in_free_window(self.cfg, datetime.now(), state):
-                    core.run_iteration_step(state, self.cfg, datetime.now())
+                info = core.monitor_tick(self.cfg)
+                if info.get("sent"):
+                    core.log(f"界面监控本轮发送 {info['sent']} 个任务"
+                             + (f"（{info['blocked']} 个被门控扣留）" if info.get("blocked") else ""))
+                _refresh_mon_label(self, info)
+                core._cleanup_rate_limits(self.cfg)
+                core._maybe_heartbeat(self.cfg, _hb_at)
+                self.state = core.load_state()
+                _err_streak[0] = 0
             except Exception as e:
+                _err_streak[0] += 1
                 core.log(f"监控线程错误: {e}")
+                # 连续异常时拉长等待，避免错误风暴刷屏/占满 CPU
+                if _err_streak[0] >= 3:
+                    core.log(f"监控线程连续 {_err_streak[0]} 轮异常，延长等待至 "
+                             f"{interval * 5}s 后再试")
+                    self._mon_stop.wait(interval * 5)
             self._mon_stop.wait(interval)
 
     def _on_close(self):
@@ -780,12 +856,18 @@ class App:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="WorkBuddy 用量/余额监控")
+    parser.add_argument("--start-monitor", action="store_true",
+                        help="启动 GUI 后自动开始后台监控")
+    args = parser.parse_args()
     root = tk.Tk()
     try:
         ttk.Style().theme_use("vista")
     except Exception:
         pass
-    App(root)
+    app = App(root)
+    if args.start_monitor:
+        root.after(500, app.on_toggle_monitor)
     root.mainloop()
 
 

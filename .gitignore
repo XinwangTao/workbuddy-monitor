@@ -4,3 +4,9 @@ state.json
 monitor.log
 __pycache__/
 *.pyc
+launch.log
+.state.lock
+.wb_token_cache
+monitor.old.log
+campaign_reply.txt
+state.json.bak

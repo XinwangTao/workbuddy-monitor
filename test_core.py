@@ -22,6 +22,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import workbuddy_monitor as core  # noqa: E402
+import workbuddy_cdp as cdp  # noqa: E402
 
 # ---------------------------------------------------------------- 环境隔离
 _TMP = Path(tempfile.mkdtemp(prefix="wbmon_test_"))
@@ -45,7 +46,9 @@ def _fake_discover_window_dom():
     return FAKE["dom_window"]
 
 
-def _fake_last_msg(timeout=240, poll=15):
+def _fake_last_msg(timeout=240, poll=15, prompt_hint=""):
+    # 记录定位提示，方便断言「按 last_prompt 定位会话」确实传到了 CDP 层
+    FAKE["last_hint"] = prompt_hint
     return FAKE["reply"]
 
 
@@ -85,6 +88,15 @@ def cfg_of(**auto_kw):
     return c
 
 
+def stamp(state, **auto):
+    """给 state 的免费目录打上「刚刚发现」时间戳（fail-closed 门控要求）。"""
+    state.setdefault("free_info", {})["models_discovered_at"] = \
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for k, v in auto.items():
+        state.setdefault("free_info", {})[k] = v
+    return state
+
+
 def t_at(h, m=0):
     """构造今天的某个时刻"""
     return datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
@@ -117,6 +129,55 @@ check("同日窗口 12:00 在内", core.in_window(W2, t_at(12)) is True)
 check("同日窗口 20:00 在外", core.in_window(W2, t_at(20)) is False)
 check("起止相同=全天", core.in_window({"start": "00:00", "end": "00:00"}, t_at(3)) is True)
 
+# ================================================================ 2.5 倍率解析（真实 DOM 无空格拼接）
+print("\n== 2.5 倍率解析（WorkBuddy 真实格式）==")
+# _parse_multiplier 只负责"已剥离模型名的倍率片段"；剥离逻辑由 classify_model 完成
+# （因为 'MiniMax-M30.25x' 这类字符串在无 name 上下文时无法可靠区分）。
+_mp = [
+    ("0.00x", 0.0, "真免费模型：倍率 0"),
+    ("0.29x", 0.29, "夜间折扣价：非免费！"),
+    ("0.25x", 0.25, "MiniMax-M3 的倍率"),
+    ("1.62x", 1.62, "Kimi-K3 的倍率"),
+    ("x2", 2.0, "前缀写法"),
+    ("倍率2", 2.0, "中文前缀"),
+    ("2倍", 2.0, "中文后缀"),
+    ("x0.5", 0.5, "半价折扣"),
+    ("", None, "空值"),
+]
+for _txt, _exp, _why in _mp:
+    _got = core._parse_multiplier(_txt)
+    check(f"倍率解析 {_txt!r} → {_exp}（{_why}）", _got == _exp, f"实际={_got}")
+check("纯模型名不误判为倍率(Hy4)", core._parse_multiplier("Hy4") is None)
+check("纯模型名不误判为倍率(Kimi-K3)", core._parse_multiplier("Kimi-K3") is None)
+
+# classify_model 端到端：从真实 text 里剥掉模型名后取倍率（回归 30.25/31.62 误判）
+_e2e_mp = [
+    ("MiniMax-M30.25x", "MiniMax-M3", 0.25, False),
+    ("Kimi-K31.62x", "Kimi-K3", 1.62, False),
+    ("GLM-5.30.79x", "GLM-5.3", 0.79, False),
+    ("Kimi-K2.8-Preview0.77x", "Kimi-K2.8-Preview", 0.77, False),
+    ("Hy4 preview夜间免费0.29x", "Hy4 preview", 0.29, False),
+    ("Hy3限时免费0.00x", "Hy3", 0.0, True),
+]
+for _text, _name, _exp_mult, _exp_free in _e2e_mp:
+    _r = core.classify_model({"name": _name, "badge": "", "text": _text, "desc": ""})
+    check(f"classify {_name}: 倍率={_exp_mult}", _r["multiplier"] == _exp_mult,
+          f"实际={_r['multiplier']} raw={_text!r}")
+    check(f"classify {_name}: free={_exp_free}", _r["free"] is _exp_free,
+          f"reason={_r['free_reason']}")
+
+# classify_model：倍率>0 一律非免费（包括徽标写"夜间免费"的折扣模型）
+_cls = [
+    ({"name": "Hy3", "badge": "限时免费", "text": "Hy3限时免费0.00x", "cost": "0.00x", "desc": ""}, True, "0.00x=真免费"),
+    ({"name": "Hy4 preview", "badge": "夜间免费", "text": "Hy4 preview夜间免费0.29x", "cost": "0.29x", "desc": ""}, False, "0.29x=折扣价，必须判非免费"),
+    ({"name": "Deepseek-V4-Pro", "badge": "夜间折扣", "text": "Deepseek-V4-Pro 夜间折扣0.51x", "cost": "0.51x", "desc": ""}, False, "夜间折扣=计费"),
+    ({"name": "X", "badge": "免费", "text": "X 免费", "cost": "", "desc": ""}, True, "明确免费且无计费倍率"),
+]
+for _item, _exp, _why in _cls:
+    _r = core.classify_model(_item)
+    check(f"classify {_item['name']} free={_exp}（{_why}）", _r["free"] is _exp,
+          f"实际={_r['free']} reason={_r['free_reason']}")
+
 # ================================================================ 3. 窗口优先级
 print("\n== 3. effective_free_window 优先级 ==")
 st = fresh_state()
@@ -127,6 +188,20 @@ check("全局已发现窗口优先", core.effective_free_window(st)["start"] == 
 st["model_catalog"] = [{"name": "A", "free": True, "free_window": {"start": "01:00", "end": "06:00"}}]
 check("模型专属窗口最优先", core.effective_free_window(st, "A")["start"] == "01:00")
 check("其他模型仍用全局窗口", core.effective_free_window(st, "B")["start"] == "22:00")
+# 配置显式指定的窗口必须优先于 free_info 里的 config 副本，
+# 否则用户/测试改了配置却被旧缓存静默覆盖（回归项）。
+st_c = fresh_state()
+st_c["free_info"] = {"window": {"start": "23:00", "end": "08:00", "source": "config"}}
+cfg_local = cfg_of(free_window={"enabled": True, "start": "00:00", "end": "23:59"})
+check("显式配置窗口优先于 config 缓存副本",
+      core.effective_free_window(st_c, None, cfg_local)["start"] == "00:00",
+      f"实际={core.effective_free_window(st_c, None, cfg_local)}")
+check("discovered 来源的窗口优先于配置",
+      core.effective_free_window(st, None, cfg_local)["start"] == "22:00")
+# 关闭时段限制时同样以配置为准
+cfg_off = cfg_of(free_window={"enabled": False, "start": "23:00", "end": "08:00"})
+check("free_window.enabled=False 时不再用配置窗口作为时段门",
+      core.in_free_window(cfg_off, t_at(14), st_c) is True)
 
 # ================================================================ 4. 模型免费判定（安全边界）
 print("\n== 4. 模型免费判定与安全边界 ==")
@@ -170,19 +245,55 @@ st2["model_catalog"] = [
     {"name": "FreeA", "free": True},
     {"name": "PaidB", "free": False},
 ]
+stamp(st2)
 cfg = cfg_of()
 check("免费模型+免费时段→放行", core.is_model_free_now("FreeA", st2, cfg, t_at(2)) is True)
 check("免费模型+非免费时段→扣留", core.is_model_free_now("FreeA", st2, cfg, t_at(14)) is False)
 check("付费模型即使免费时段也扣留", core.is_model_free_now("PaidB", st2, cfg, t_at(2)) is False)
 check("未发现过的模型一律扣留（防误扣积分）", core.is_model_free_now("Unknown", st2, cfg, t_at(2)) is False)
-st3 = fresh_state()
-check("无发现数据→回退全局时段 02:00 放行", core.is_model_free_now("Any", st3, cfg, t_at(2)) is True)
-check("无发现数据→回退全局时段 14:00 扣留", core.is_model_free_now("Any", st3, cfg, t_at(14)) is False)
+
+# fail-closed：目录没有发现时间戳（旧状态/手工构造）→ 一律扣留并提示重新发现
+st_u = fresh_state()
+st_u["model_catalog"] = [{"name": "FreeA", "free": True}]  # 故意不打时间戳
+r_u = core.free_gate_reason("FreeA", st_u, cfg, t_at(2))
+check("目录无时间戳→fail-closed 扣留", core.is_model_free_now("FreeA", st_u, cfg, t_at(2)) is False)
+check("目录无时间戳→原因说明需重新发现", "时间戳" in r_u, f"实际={r_u}")
+
+# fail-closed：目录过期（超过保鲜期）→ 扣留
+st_old = fresh_state()
+st_old["model_catalog"] = [{"name": "FreeA", "free": True}]
+st_old["free_info"] = {
+    "models_discovered_at": (datetime.now() - timedelta(hours=12)).strftime("%Y-%m-%d %H:%M:%S")}
+check("目录过期 12h→fail-closed 扣留", core.is_model_free_now("FreeA", st_old, cfg, t_at(2)) is False)
+check("目录过期原因含'过期'", "过期" in core.free_gate_reason("FreeA", st_old, cfg, t_at(2)))
+
+# fail-closed：完全没有目录 → 扣留（不再有"无数据也放行"的回退）
+st_missing = fresh_state()
+check("无目录→fail-closed 扣留", core.is_model_free_now("Any", st_missing, cfg, t_at(2)) is False)
+check("无目录→原因说明缺目录", "尚无免费模型目录" in core.free_gate_reason("Any", st_missing, cfg, t_at(2)))
+
+# 限流闸门：未到重置时间即使是免费模型也不发
+st_rl = fresh_state()
+st_rl["model_catalog"] = [{"name": "FreeA", "free": True}]
+st_rl["free_info"] = {"models_discovered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+st_rl["rate_limits"] = {"FreeA": {"model": "FreeA",
+                                  "reset": (datetime.now() + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")}}
+check("限流中→不可发", core.is_model_free_now("FreeA", st_rl, cfg, t_at(2)) is False)
+check("限流→原因含重置时间", "限流" in core.free_gate_reason("FreeA", st_rl, cfg, t_at(2)))
+
+# 用户显式关闭时段限制 → 目录可信即可发（不再要求窗口内）
+st_off = fresh_state()
+st_off["model_catalog"] = [{"name": "FreeA", "free": True}]
+stamp(st_off)
+cfg_off = cfg_of(free_window={"enabled": False, "start": "23:00", "end": "08:00"})
+check("关闭时段限制→白天也可发（模型已确认免费）",
+      core.is_model_free_now("FreeA", st_off, cfg_off, t_at(14)) is True)
 
 # ================================================================ 6. task_sendable_now
 print("\n== 6. 统一调度 task_sendable_now ==")
 st4 = fresh_state()
 st4["model_catalog"] = [{"name": "FreeA", "free": True}, {"name": "PaidB", "free": False}]
+stamp(st4)
 now_night = t_at(2)
 now_day = t_at(14)
 
@@ -190,8 +301,13 @@ t1 = {"content": "x", "model": "FreeA", "status": "pending"}
 check("免费模型+免费时段→可发", core.task_sendable_now(t1, st4, cfg, now_night) is True)
 check("免费模型+非免费时段→不可发", core.task_sendable_now(t1, st4, cfg, now_day) is False)
 
+# 积分任务不再能绕过免费门控：allow_credit 只影响"是否允许扣积分"的老语义已废弃，
+# 免费额度用尽后必须停下（用户明确要求：不再发送新对话）。
 t2 = {"content": "x", "model": "FreeA", "status": "pending", "allow_credit": True}
-check("allow_credit 显式允许→非免费时段也可发", core.task_sendable_now(t2, st4, cfg, now_day) is True)
+check("allow_credit 不再能绕过免费时段门控",
+      core.task_sendable_now(t2, st4, cfg, now_day) is False)
+t2p = {"content": "x", "model": "PaidB", "status": "pending", "allow_credit": True}
+check("allow_credit 不放过付费模型", core.task_sendable_now(t2p, st4, cfg, now_night) is False)
 
 future = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
 past = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
@@ -203,6 +319,7 @@ check("已过指定时间但在白天→仍被 free_only 扣留", core.task_send
 
 st5 = fresh_state()
 st5["model_catalog"] = [{"name": "FreeA", "free": True}]
+stamp(st5)
 st5["rate_limits"] = {"FreeA": {"model": "FreeA", "reset": future}}
 t5 = {"content": "x", "model": "FreeA"}
 check("模型仍被限流（未到重置）→不可发", core.task_sendable_now(t5, st5, cfg, now_night) is False)
@@ -210,10 +327,15 @@ st5["rate_limits"] = {"FreeA": {"model": "FreeA", "reset": past}}
 check("限流已过重置时间→可发", core.task_sendable_now(t5, st5, cfg, now_night) is True)
 
 st6 = fresh_state()
+st6["model_catalog"] = [{"name": "FreeA", "free": True}]
+stamp(st6)
 st6["rate_limits"] = {"FreeA": {"model": "FreeA", "reset": "不是合法时间"}}
-check("非法重置时间戳不崩溃且放行", core.task_sendable_now(t5, st6, cfg, now_night) is True)
+check("非法重置时间戳不崩溃且按免费资格放行",
+      core.task_sendable_now(t5, st6, cfg, now_night) is True)
 
 st7 = fresh_state()
+st7["model_catalog"] = [{"name": "FreeA", "free": True}]
+stamp(st7)
 core.set_balance_guard_paused(st7, True, "测试暂停")
 check("余额守卫暂停中→一律不可发", core.task_sendable_now(t1, st7, cfg, now_night) is False)
 
@@ -325,6 +447,7 @@ check("非法策略回退 improve",
 print("\n== 10. 迭代任务生成与全链路连跑 ==")
 std = fresh_state()
 std["model_catalog"] = [{"name": "FreeA", "free": True}, {"name": "PaidB", "free": False}]
+stamp(std)
 cfg2 = cfg_of()
 cc = core.create_campaign(std, "目标：写个工具", strategy="improve")
 tt = core.ensure_campaign_task(cc, std, cfg2, t_at(2))
@@ -346,6 +469,7 @@ check("指定模型非免费时回退到免费模型",
 print("\n== 11. 全链路：发送→捕获回复→推进→续跑 ==")
 ste = fresh_state()
 ste["model_catalog"] = [{"name": "FreeA", "free": True}]
+stamp(ste)
 FAKE["reply"] = "已完成第一版实现，代码可运行。"
 ce = core.create_campaign(ste, "目标", strategy="improve", max_iterations=0)
 core.ensure_campaign_task(ce, ste, cfg2, t_at(2))
@@ -384,6 +508,7 @@ check("恢复后清空在途状态",
 # 非免费时段不应推进迭代
 stf = fresh_state()
 stf["model_catalog"] = [{"name": "FreeA", "free": True}]
+stamp(stf)
 cf = core.create_campaign(stf, "目标", strategy="improve")
 before = cf["current_iteration"]
 check("白天调用 run_iteration_step 不推进（由 run_loop 守卫）",
@@ -400,7 +525,9 @@ stg = fresh_state()
 check("空 state 不崩溃(effective_free_window)", core.effective_free_window({})["start"] == "23:00")
 check("空 state 不崩溃(active_campaigns)", core.active_campaigns({}) == [])
 check("空 state 不崩溃(is_model_free_now)",
-      core.is_model_free_now("", {}, cfg2, t_at(2)) is True)
+      core.is_model_free_now("", {}, cfg2, t_at(2)) is False)
+check("空目录原因可读(fail-closed)", "尚无免费模型目录" in
+      core.free_gate_reason("", {}, cfg2, t_at(2)))
 check("ensure_campaigns 补齐默认值",
       core.ensure_campaigns({"campaigns": [{"id": 1}]})[0]["history"] == [])
 stz = fresh_state()
@@ -411,11 +538,23 @@ check("set_campaign_status 不存在返回 False", core.set_campaign_status(stz,
 print("\n== 13. 发送通道（command / api / 付费模型扣留）==")
 # command 模式：空命令不实际执行，但必须能正常标记 sent（曾因变量未定义抛 NameError）
 sts = fresh_state()
-sts["model_catalog"] = [{"name": "FreeA", "free": True}, {"name": "PaidB", "free": False}]
+# 免费时段门控必须在发送通道之前生效：白天（当前 12:00）先验证被拦截
 cfg_cmd = cfg_of()
 cfg_cmd["send_mode"] = "command"
 cfg_cmd["send_command"] = ""
+sts["model_catalog"] = [{"name": "FreeA", "free": True}, {"name": "PaidB", "free": False}]
+stamp(sts)
 tkc = core.add_task(sts, "命令模式任务", model="FreeA")
+# send_task 会重新 load_state() 做安全复检，因此目录时间戳必须落盘才被认可
+_d = core.load_state()
+_d["model_catalog"] = sts["model_catalog"]
+stamp(_d)
+core.save_state(_d)
+check("免费时段外 command 模式被拦截（fail-closed）",
+      core.free_gate_reason("FreeA", core.load_state(), cfg_cmd, t_at(12)) != "")
+
+# 命令通道本身不崩溃（回归 NameError）：在「模拟免费时段」下执行
+cfg_cmd["auto_send"]["free_window"] = {"enabled": True, "start": "00:00", "end": "23:59"}
 try:
     core.send_task(tkc, cfg_cmd)
     crashed = None
@@ -428,9 +567,15 @@ check("command 模式正确标记 sent",
 # api 模式：未配置 url 时跳过请求，同样必须能标记 sent
 sta = fresh_state()
 sta["model_catalog"] = [{"name": "FreeA", "free": True}]
+stamp(sta)
 cfg_api = cfg_of()
 cfg_api["send_mode"] = "api"
 tka = core.add_task(sta, "API模式任务", model="FreeA")
+_d2 = core.load_state()
+_d2["model_catalog"] = sta["model_catalog"]
+stamp(_d2)
+core.save_state(_d2)
+cfg_api["auto_send"]["free_window"] = {"enabled": True, "start": "00:00", "end": "23:59"}
 try:
     core.send_task(tka, cfg_api)
     crashed = None
@@ -528,8 +673,11 @@ reply_file.unlink(missing_ok=True)
 # 16.2 防死锁自愈：在途回复超时且 CDP 无回复 → 记一次失败并续跑
 sg = fresh_state()
 sg["model_catalog"] = [{"name": "FreeA", "free": True}]
+stamp(sg)
 cg = core.create_campaign(sg, "目标", strategy="improve", max_iterations=0)
 core.ensure_campaign_task(cg, sg, cfg2, t_at(2))
+stamp(sg)
+core.save_state(sg)
 cam = core.campaign_by_id(sg, cg["id"])
 cam["awaiting_result_at"] = "2026-09-23 00:00:00"   # 置于免费时段之前（已超时）
 core.save_state(sg)
@@ -570,6 +718,682 @@ finally:
     import shutil
     shutil.rmtree(_gitdir, ignore_errors=True)
 check("_repo_has_code_change 非 git 目录→None", core._repo_has_code_change(str(_TMP)) is None)
+
+# ================================================================ 17. fail-closed 门控 / 心跳 / 自检
+print("\n== 17. fail-closed 门控与可观测性 ==")
+# 目录过期：校验 fail-closed 不发送
+st_x = fresh_state()
+st_x["model_catalog"] = [{"name": "FreeA", "free": True}]
+st_x["free_info"] = {"models_discovered_at":
+                     (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")}
+tx = core.add_task(st_x, "过期目录任务", model="FreeA")
+check("目录超过保鲜期→任务不可发送",
+      core.task_sendable_now({"model": "FreeA"}, st_x, cfg2, t_at(2)) is False)
+core.send_task({"id": tx["id"], "content": "x", "model": "FreeA"}, cfg2)
+check("目录过期时 send_task 拦截发送",
+      core.load_state()["tasks"][-1]["status"] == "pending")
+
+# send_block_reason 应给出可读原因
+why = core.send_block_reason({"model": "FreeA"}, st_x, cfg2)
+check("send_block_reason 返回可读原因", "过期" in why, f"实际={why}")
+
+# 迭代活动：模型非免费/目录不可信 → 暂停且不生成新任务
+st_y = fresh_state()
+st_y["model_catalog"] = [{"name": "PaidOnly", "free": False}]
+stamp(st_y)
+cy = core.create_campaign(st_y, "目标", strategy="improve")
+core.run_iteration_step(st_y, cfg2, t_at(2))
+cy_r = core.campaign_by_id(core.load_state(), cy["id"])
+check("仅付费模型→活动被暂停（不生成任务）", cy_r["status"] == "paused")
+check("暂停原因记录在 pause_reason", bool(cy_r.get("pause_reason")), f"实际={cy_r.get('pause_reason')}")
+check("暂停后未生成新任务",
+      len([t for t in core.load_state()["tasks"] if t.get("campaign_id") == cy["id"]]) == 0)
+
+# 恢复后 pause_reason 清空
+core.set_campaign_status(core.load_state(), cy["id"], "running")
+cy_r2 = core.campaign_by_id(core.load_state(), cy["id"])
+check("恢复活动后清空 pause_reason", cy_r2.get("pause_reason") == "")
+
+# 自检与心跳：不抛异常且写日志
+try:
+    txt = core.startup_selfcheck(cfg2, fresh_state())
+    ok_sc = isinstance(txt, str) and "启动自检" in txt
+except Exception as e:  # noqa: BLE001
+    ok_sc = False
+check("startup_selfcheck 返回摘要", ok_sc)
+try:
+    core.log_heartbeat(fresh_state(), cfg2, t_at(2))
+    ok_hb = True
+except Exception:  # noqa: BLE001
+    ok_hb = False
+check("log_heartbeat 不抛异常", ok_hb)
+_heart = core.LOG_FILE.read_text(encoding="utf-8-sig")
+check("心跳已写入日志文件", "监控心跳" in _heart)
+
+# ================================================================ 18. 并发写保护
+print("\n== 18. state.json 并发写保护 ==")
+import threading as _th
+import time as _time
+st_c = fresh_state()
+_errors = []
+
+
+def _writer(n):
+    try:
+        for i in range(15):
+            core.add_task(st_c, f"concurrent-{n}-{i}", model="X")
+    except Exception as e:  # noqa: BLE001
+        _errors.append(f"{type(e).__name__}: {e}")
+
+
+_t0 = _time.time()
+_ths = [_th.Thread(target=_writer, args=(n,)) for n in range(4)]
+[t.start() for t in _ths]
+[t.join() for t in _ths]
+_elapsed = _time.time() - _t0
+_rows = core.load_state().get("tasks", [])
+check("并发 4x15 入队无丢失（回归丢更新）", len(_rows) == 60, f"实际={len(_rows)}")
+check("并发写入无异常", not _errors, "; ".join(_errors[:2]))
+check("并发写入未造成文件损坏", isinstance(json.load(open(core.STATE_FILE, encoding="utf-8")), dict))
+check("可重入锁无长时间阻塞（嵌套获取<5s）", _elapsed < 30, f"耗时={_elapsed:.1f}s")
+
+# ================================================================ 19. advance_campaign 不写丢其他活动
+print("\n== 19. advance_campaign 并发合并写回 ==")
+sa = fresh_state()
+c_old = core.create_campaign(sa, "活动甲", strategy="improve", max_iterations=0)
+# 模拟 GUI/另一进程在此期间创建了活动乙
+c_new = core.create_campaign(core.load_state(), "活动乙", strategy="improve", max_iterations=0)
+# 用只含甲的旧内存视图推进甲：乙绝不能被写丢
+stale = core.load_state()
+stale["campaigns"] = [c for c in stale["campaigns"] if c.get("id") == c_old["id"]]
+core.advance_campaign(c_old, "第一轮：完成基础实现，测试通过。", stale)
+disk = core.load_state()
+ids = [c.get("id") for c in disk["campaigns"]]
+check("advance 不写丢其他活动（回归）", c_new["id"] in ids, f"磁盘活动 ids={ids}")
+check("甲的历史已记录", len(c_old.get("history", [])) == 1)
+check("乙仍保持初始状态",
+      core.campaign_by_id(disk, c_new["id"])["current_iteration"] == 0)
+
+# ================================================================ 20. CDP 不可用时不得用旧目录冒充"已发现"
+print("\n== 20. CDP 不可用时的自愈与门控 ==")
+# fake CDP：假装 WorkBuddy 不在运行
+FAKE["models"] = []
+FD = types.ModuleType("workbuddy_cdp")
+FD.list_models = lambda: []
+FD.discover_free_window_dom = lambda: None
+FD.last_assistant_message = lambda *a, **k: None
+FD.is_workbuddy_running = lambda: False
+FD.current_model = lambda: ""
+FD.read_credits = lambda: None
+FD.select_model = lambda *a, **k: (True, "")
+FD.REPLY_SELECTORS = []
+sys.modules["workbuddy_cdp"] = FD
+
+st_d = fresh_state()
+st_d["model_catalog"] = [{"name": "Hy4 preview", "free": True}]
+st_d["free_info"] = {
+    "models_discovered_at": (datetime.now() - timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")}
+core.save_state(st_d)
+check("CDP 不可用→discover 返回 None（不拿旧目录冒充成功）",
+      core.discover_free_models(cfg2, core.load_state(), force=True) is None)
+check("CDP 不可用→自愈失败（不假成功）",
+      core.refresh_free_discovery(cfg2, core.load_state(), force=True) is False)
+# WorkBuddy 不在线时：目录超过保鲜期即 fail-closed
+check("CDP 不可用 + 目录过期→扣留",
+      core.is_model_free_now("Hy4 preview", core.load_state(), cfg2, t_at(2)) is False)
+
+# ================================================================ 21. 共享监控步骤 monitor_tick
+print("\n== 21. monitor_tick（CLI/GUI 共用路径）==")
+# 恢复一个"可用"的 fake CDP（Hy4 免费），并放到免费时段
+FAKE["models"] = [{"name": "Hy4", "badge": "免费", "text": "Hy4 免费", "desc": ""},
+                  {"name": "PaidX", "badge": "x2", "text": "PaidX x2 积分"}]
+FAKE["dom_window"] = None
+FAKE["reply"] = None
+st_t = fresh_state()
+cfg_t = cfg_of(free_window={"enabled": True, "start": "00:00", "end": "23:59"})
+core.discover_free_models(cfg_t, st_t, force=True)
+st_t = core.load_state()
+camp = core.create_campaign(st_t, "monitor_tick 目标", strategy="improve", max_iterations=0)
+info = core.monitor_tick(cfg_t)
+check("monitor_tick 返回结构化摘要",
+      isinstance(info, dict) and {"sent", "blocked", "iterated"} <= set(info), f"实际={info}")
+check("monitor_tick 识别免费时段", info.get("in_free_window") is True)
+check("monitor_tick 本轮拦截了 N 个待发任务（免费门控生效）",
+      isinstance(info.get("blocked"), int))
+check("monitor_tick 不因缺 CDP 崩溃", "errors" in info)
+
+# 余额守卫暂停时：不应发送，只做检测
+st_g = core.load_state()
+core.set_balance_guard_paused(st_g, True, "测试暂停")
+info2 = core.monitor_tick(cfg_t)
+check("守卫暂停→monitor_tick 直接返回且 sent=0",
+      info2.get("guard_paused") is True and info2.get("sent") == 0)
+core.set_balance_guard_paused(core.load_state(), False, "")
+
+# ================================================================ 22. 倍率0=全天免费 vs 未知倍率=仍需时段
+print("\n== 22. 全天免费（0.00x）与未知倍率的区分 ==")
+_st = fresh_state()
+_st["model_catalog"] = [
+    {"name": "Hy3", "free": True, "multiplier": 0.0, "badge": "限时免费"},        # 0.00x 全天免费
+    {"name": "Unknown", "free": True, "multiplier": None, "badge": "免费"},      # 未解析到倍率→保守
+]
+stamp(_st)
+_night, _day = t_at(2), t_at(14)
+check("Hy3(0.00x) 白天也可发（全天免费）",
+      core.task_sendable_now({"model": "Hy3"}, _st, cfg2, _day) is True)
+check("Hy3(0.00x) 夜间也可发",
+      core.task_sendable_now({"model": "Hy3"}, _st, cfg2, _night) is True)
+check("未知倍率白天仍扣留（保守，避免误判免费）",
+      core.task_sendable_now({"model": "Unknown"}, _st, cfg2, _day) is False)
+check("未知倍率夜间放行",
+      core.task_sendable_now({"model": "Unknown"}, _st, cfg2, _night) is True)
+check("倍率>0 一律非免费（0.29x 不因'夜间免费'徽标放行）",
+      core.classify_model({"name": "Hy4 preview", "badge": "夜间免费",
+                           "text": "Hy4 preview夜间免费0.29x", "cost": "0.29x"})["free"] is False)
+
+# ================================================================ 23. 回复捕获：真实 DOM 结构 / footer 剥离 / 噪声过滤
+print("\n== 23. 回复捕获（基于 5.6.2 真实 DOM 的解析）==")
+# test_core 全程把 sys.modules['workbuddy_cdp'] 换成 fake，这里按文件路径加载真实模块
+import importlib.util as _ilu  # noqa: E402
+_spec = _ilu.spec_from_file_location("_real_workbuddy_cdp", str(HERE / "workbuddy_cdp.py"))
+real_cdp = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(real_cdp)
+
+# 真实抓取到的 WorkBuddy 5.6.2 对话结构（user/agent 交替，agent 带 footer 元数据）
+_CONV = [
+    {"role": "user", "text": "只回复固定文本：WB_REAL_DEEPSEEK_20260923_1555_OK"},
+    {"role": "assistant", "text": "WB_REAL_DEEPSEEK_20260923_1555_OK"},
+    {"role": "user", "text": "链路自测：请只回复四个字：链路正常"},
+    {"role": "assistant", "text": "链路正常"},
+]
+
+_fake_reads = {"conv": None}
+
+
+def _fake_read_conversation():
+    return _fake_reads["conv"]
+
+
+_real_read = real_cdp.read_conversation
+_real_gen = real_cdp._agent_still_generating
+real_cdp.read_conversation = _fake_read_conversation
+real_cdp._agent_still_generating = lambda: False
+# 只 patch _ensure_conversation_open 依赖的两个底层函数（不 patch 它本身），
+# 否则后面的「按 prompt_hint 定位会话」用例拿不到真实实现。
+real_cdp._in_conversation_page = lambda: True
+
+_fake_reads["conv"] = _CONV
+check("多轮对话取本轮提示词后的助手回复",
+      real_cdp._read_last_agent_reply("链路自测：请只回复四个字：链路正常") == "链路正常",
+      f"实际={real_cdp._read_last_agent_reply('链路自测：请只回复四个字：链路正常')!r}")
+
+# footer 元数据（模型名 / 时间）必须被剥掉
+_fake_reads["conv"] = [
+    {"role": "user", "text": "链路自测：请只回复四个字：链路正常"},
+    {"role": "assistant", "text": "链路正常\n\nHy3\n13:13"}]
+check("剥掉 footer 的模型名+时间",
+      real_cdp._read_last_agent_reply("链路自测：请只回复四个字：链路正常") == "链路正常",
+      f"实际={real_cdp._read_last_agent_reply('链路自测：请只回复四个字：链路正常')!r}")
+
+_fake_reads["conv"] = [
+    {"role": "user", "text": "链路自测：请只回复四个字：链路正常"},
+    {"role": "assistant", "text": "正文内容\n\n共消耗\n1.02\nDeepseek-V4.1-Flash\n昨天 16:19"}]
+check("剥掉「共消耗/模型/时间」尾部",
+      real_cdp._read_last_agent_reply("链路自测：请只回复四个字：链路正常") == "正文内容",
+      f"实际={real_cdp._read_last_agent_reply('链路自测：请只回复四个字：链路正常')!r}")
+
+_fake_reads["conv"] = [
+    {"role": "user", "text": "链路自测：请只回复四个字：链路正常"},
+    {"role": "assistant", "text": "第一行\n第二行\n\nGLM-5.3-Flash\n09:24"}]
+check("剥掉多行正文尾部的元数据（保留前面的换行）",
+      real_cdp._read_last_agent_reply("链路自测：请只回复四个字：链路正常") == "第一行\n第二行",
+      f"实际={real_cdp._read_last_agent_reply('链路自测：请只回复四个字：链路正常')!r}")
+
+# 用户自己发的消息绝不能当回复
+_fake_reads["conv"] = [{"role": "user", "text": "链路自测：请只回复四个字：链路正常"}]
+check("只有 user 消息时读不到回复",
+      real_cdp._read_last_agent_reply("链路自测：请只回复四个字：链路正常") is None)
+
+# 首页无障碍文案等噪声不得当回复
+_fake_reads["conv"] = [
+    {"role": "user", "text": "链路自测：请只回复四个字：链路正常"},
+    {"role": "assistant", "text": "To pick up a draggable item, press the space bar."}]
+check("无障碍提示文案判为噪声",
+      real_cdp._read_last_agent_reply("链路自测：请只回复四个字：链路正常") is None)
+
+_fake_reads["conv"] = [
+    {"role": "user", "text": "链路自测：请只回复四个字：链路正常"},
+    {"role": "assistant", "text": "今天帮你做什么？"}]
+check("首页占位文案判为噪声",
+      real_cdp._read_last_agent_reply("链路自测：请只回复四个字：链路正常") is None)
+
+_fake_reads["conv"] = None
+check("非对话页/读不到时返回 None", real_cdp._read_last_agent_reply("x") is None)
+
+# 带「深度思考」折叠块的真实回复：思考过程绝不能混进回复正文。
+# 真实 DOM（Hy3 深度思考时）：.cr-agent__content > [.cr-collapse(已完成 10s + 思考),
+#                                                  .cr-text-block(正文)]
+# JS 层已按 class 过滤 collapse/footer，这里再把该规则在 Python 侧兜底：
+import re as _re
+
+def _py_pick_blocks(text: str) -> str:
+    """模拟 JS 的块过滤：丢掉 collapse/footer 前缀块，只留正文。"""
+    if not text:
+        return ""
+    parts = [p for p in text.split("\n")]
+    # 首个块若以「已完成 Ns」开头（collapse 头部），视为思考块，连同其后到下一个空行前的内容丢弃
+    if parts and _re.match(r"^已完成\s*\d+", parts[0].strip()):
+        parts = parts[1:]
+        # 跳过思考内容（通常以空行结束）
+        while parts and parts[0].strip():
+            parts = parts[1:]
+        while parts and not parts[0].strip():
+            parts = parts[1:]
+    return "\n".join(parts).strip()
+
+
+_think_case = "已完成 10s\nThe user is asking me to self-test the link\n\n链路正常"
+check("深度思考块被剔除、只留真实正文",
+      _py_pick_blocks(_think_case) == "链路正常", f"实际={_py_pick_blocks(_think_case)!r}")
+check("普通回复（无思考块）原样返回",
+      _py_pick_blocks("链路正常") == "链路正常")
+check("回复选择器含 5.6.2 正文容器", real_cdp.REPLY_SELECTORS[0] == ".cr-agent__content")
+check("读取会话 JS 会过滤 collapse/footer",
+      "collapse" in real_cdp._JS_READ_CONVERSATION and "footer" in real_cdp._JS_READ_CONVERSATION)
+
+# last_assistant_message：生成未结束必须等待，绝不把半截内容当回复推进迭代
+_seq = {"n": 0}
+
+
+def _seq_gen():
+    _seq["n"] += 1
+    return _seq["n"] < 3          # 前两次轮询仍在生成
+
+
+# 说明「本轮提示词」→ 回复必须按顺序配对：这里 fixture 的 user 消息就是提示词
+_CONV_LIVE = [
+    {"role": "user", "text": "链路自测：请只回复四个字：链路正常"},
+    {"role": "assistant", "text": "链路正常"},
+]
+real_cdp.read_conversation = lambda: _CONV_LIVE
+real_cdp._agent_still_generating = _seq_gen
+_t0 = _time.time()
+_got = real_cdp.last_assistant_message(timeout=6, poll=0.2,
+                                      prompt_hint="链路自测：请只回复四个字：链路正常")
+check("流式生成中会等待完成", _got == "链路正常" and _seq["n"] >= 3,
+      f"实际={_got!r} 轮询={_seq['n']}")
+
+# 一直不结束：宁可超时返回 None，也不返回半截内容
+_seq["n"] = 0
+real_cdp._agent_still_generating = lambda: True
+_t1 = _time.time()
+_got2 = real_cdp.last_assistant_message(timeout=1, poll=0.2,
+                                       prompt_hint="链路自测：请只回复四个字：链路正常")
+check("始终在生成→超时返回 None（不拿半截内容推进迭代）",
+      _got2 is None and 0.8 <= _time.time() - _t1 <= 3, f"实际={_got2!r}")
+
+# 已生成完成：立即返回，不空等
+_seq["n"] = 0
+real_cdp._agent_still_generating = lambda: False
+_t2 = _time.time()
+_got3 = real_cdp.last_assistant_message(timeout=6, poll=0.2,
+                                        prompt_hint="链路自测：请只回复四个字：链路正常")
+check("生成完成后立即返回（不再空等）",
+      _got3 == "链路正常" and _time.time() - _t2 < 3, f"耗时={_time.time()-_t2:.1f}s")
+
+# 关键：提示词匹配不到时，绝不拿别人的回复冒充本轮产出
+_old_conv = [
+    {"role": "user", "text": "完全无关的另一个会话的问题"},
+    {"role": "assistant", "text": "那是别的会话的回复"},
+]
+real_cdp.read_conversation = lambda: _old_conv
+real_cdp._agent_still_generating = lambda: False
+_got4 = real_cdp.last_assistant_message(timeout=2, poll=0.2,
+                                       prompt_hint="本轮真正发送的提示词内容")
+check("提示词匹配不到→拿不到回复（不拿别会话内容冒充）", _got4 is None, f"实际={_got4!r}")
+
+# 多轮会话中，取的是「本轮提示词之后」那条，而不是最后一条
+_multi = [
+    {"role": "user", "text": "第一轮的提示词"},
+    {"role": "assistant", "text": "第一轮的回复"},
+    {"role": "user", "text": "第二轮的提示词"},
+    {"role": "assistant", "text": "第二轮的回复"},
+]
+real_cdp.read_conversation = lambda: _multi
+_got5 = real_cdp.last_assistant_message(timeout=2, poll=0.2, prompt_hint="第一轮的提示词")
+check("按提示词取对应回复，而非笼统取最后一条",
+      _got5 == "第一轮的回复", f"实际={_got5!r}")
+real_cdp.read_conversation = lambda: _CONV_LIVE
+
+# 定位会话：优先按 prompt_hint 前缀匹配，匹配不到才退回第一个
+_opened = []
+real_cdp._in_conversation_page = lambda: False
+real_cdp._open_conversation_by_title = lambda kw: (_opened.append(kw), True)[1]
+real_cdp._open_latest_conversation = lambda: _opened.append("<latest>") or True
+real_cdp._ensure_conversation_open("项目目标：真实链路自测：请只回复四个字")
+_hint = "项目目标：真实链路自测：请只回复四个字"
+_want = [_hint[:24], _hint[:16], _hint[:8], "<latest>"]
+check("按提示词前缀定位会话（多级前缀依次尝试）",
+      _opened[:4] == _want, f"实际={_opened}")
+
+_opened.clear()
+real_cdp._open_conversation_by_title = lambda kw: False
+real_cdp._ensure_conversation_open("")
+check("无提示词/匹配失败时退回打开首个会话",
+      _opened == ["<latest>"] or _opened[-1:] == ["<latest>"], f"实际={_opened}")
+
+# 前缀逐级降级：24 → 16 → 8 全部匹配失败，才退回打开首个会话
+_long = "很长的任务提示词内容超过十六个字符"
+_opened.clear()
+
+
+def _rec_open(kw):
+    _opened.append(kw)
+    return False        # 一律匹配不到
+
+
+real_cdp._open_conversation_by_title = _rec_open
+real_cdp._ensure_conversation_open(_long)
+check("前缀逐级降级（24→16→8）后仍失败才退回首个",
+      _opened[:3] == [_long[:24], _long[:16], _long[:8]] and _opened[-1] == "<latest>",
+      f"实际={_opened}")
+
+# 恢复真实函数，避免污染后续用例
+real_cdp.read_conversation = _real_read
+real_cdp._agent_still_generating = _real_gen
+
+# try_capture_campaign_result 必须把 last_prompt 作为定位提示传下去
+_cap_seen = {}
+
+
+class _CapCDP:
+    @staticmethod
+    def last_assistant_message(timeout=240, poll=15, prompt_hint=""):
+        _cap_seen["hint"] = prompt_hint
+        return "捕获到的回复"
+
+
+sys.modules["workbuddy_cdp"] = _CapCDP
+_camp = {"id": 1, "last_task_id": 1, "last_prompt": "项目目标：真实链路自测：请只回复四个字"}
+_cap = core.try_capture_campaign_result(_camp, cfg2, timeout=1, poll=1)
+check("捕获回复时按 last_prompt 定位会话",
+      _cap == "捕获到的回复" and _cap_seen.get("hint") == "项目目标：真实链路自测：请只回复四个字",
+      f"实际={_cap!r} hint={_cap_seen.get('hint')!r}")
+
+# ================================================================ 24. autopilot：模型自主决定下一步方向
+print("\n== 24. autopilot（方向由 WorkBuddy 自己决定）==")
+check("autopilot 已注册为合法策略", "autopilot" in core.ITER_STRATEGIES)
+
+_ap = core.create_campaign(core.load_state(), "autopilot 目标", strategy="autopilot",
+                           model="FreeA", max_iterations=0)
+check("创建 autopilot 活动带 next_step 字段",
+      _ap.get("next_step") == "" and _ap.get("next_step_missing") == 0)
+
+# 首轮提示词必须要求模型给出 [[NEXT]] 方向
+_p0, _l0 = core.generate_next_prompt(_ap, core.load_state())
+check("首轮提示词要求模型自定方向", "[[NEXT]]" in _p0 and "[[/NEXT]]" in _p0,
+      f"len={len(_p0)}")
+check("首轮 label 标记为自主决策", "自主决策" in _l0, f"label={_l0}")
+
+# 模型给出方向后，第二轮直接以它为本轮任务
+_ap["next_step"] = "为 B 模块补边界测试并跑通回归"
+_p1, _l1 = core.generate_next_prompt(_ap, core.load_state())
+check("第二轮直接用模型给的方向作为本轮任务",
+      "为 B 模块补边界测试并跑通回归" in _p1 and _l1 == "为 B 模块补边界测试并跑通回归",
+      f"label={_l1}")
+
+# 标记解析的各种形态
+check("正常提取方向", core.extract_next_step("汇报...\n[[NEXT]]补充 README 测试章节[[/NEXT]]")[0]
+      == "补充 README 测试章节")
+check("方向前后有空白/代码围栏也能提取",
+      core.extract_next_step("[[NEXT]]\n```\n改写 parse 函数\n```\n[[/NEXT]]")[0] is not None)
+check("漏写标记返回 no-marker", core.extract_next_step("没有任何标记的回复") == (None, "no-marker"))
+check("空方向返回 too-short", core.extract_next_step("[[NEXT]][[/NEXT]]")[0] is None)
+check("空文本返回 empty", core.extract_next_step("") == (None, "empty"))
+
+# 推进时方向被存进 next_step
+_ap2 = core.create_campaign(core.load_state(), "autopilot2", strategy="autopilot",
+                            model="FreeA", max_iterations=0)
+core.advance_campaign(_ap2, "改了一份代码\n[[NEXT]]跑通全部测试并汇报[[/NEXT]]", core.load_state())
+check("推进后 next_step 记录模型给的方向",
+      _ap2.get("next_step") == "跑通全部测试并汇报", f"实际={_ap2.get('next_step')!r}")
+check("给出方向后不漏写计数", _ap2.get("next_step_missing") == 0)
+
+# 连续漏写 -> 连续 3 次后自动暂停，不会无限空转
+_ap3 = core.create_campaign(core.load_state(), "autopilot3", strategy="autopilot",
+                            model="FreeA", max_iterations=0)
+# 每轮产出差异足够大，避免触发停滞检测，单独隔离「漏写方向」这一条
+for _txt in ("修复了解析越界并补充了回归用例", "重构了配置载入逻辑并加入默认值合并",
+             "顺手把日志编码统一成 UTF-8"):
+    core.advance_campaign(_ap3, _txt, core.load_state())
+check("连续 3 轮漏写方向→自动暂停",
+      _ap3.get("status") == "paused" and _ap3.get("next_step_missing") == 3,
+      f"status={_ap3.get('status')} missing={_ap3.get('next_step_missing')}")
+check("暂停原因写明了是漏写 [[NEXT]]", "[[NEXT]]" in (_ap3.get("pause_reason") or ""),
+      f"实际={_ap3.get('pause_reason')!r}")
+
+# 多条件同时命中时，pause_reason 只保留根因（第一个），且日志记录全部命中项
+_ap4 = core.create_campaign(core.load_state(), "autopilot4", strategy="autopilot",
+                            model="FreeA", max_iterations=0)
+_same = "一模一样的回复内容，没有任何变化"
+for _i in range(3):
+    core.advance_campaign(_ap4, _same, core.load_state())
+check("多条件命中时 pause_reason 是单一根因",
+      isinstance(_ap4.get("pause_reason"), str) and _ap4.get("pause_reason")
+      and "、" not in _ap4.get("pause_reason"), f"实际={_ap4.get('pause_reason')!r}")
+check("暂停后仍标记为 paused", _ap4.get("status") == "paused")
+
+# ================================================================ 25. 发送前后必须校验输入框（拒绝空消息）
+print("\n== 25. 发送前/后输入框校验（防静默丢消息）==")
+_editor_text = {"v": ""}
+
+
+class _EdCDP:
+    is_workbuddy_running = staticmethod(lambda: True)
+    editor_contains = staticmethod(lambda needle: needle in _editor_text["v"])
+    focus_editor = staticmethod(lambda: True)
+    start_new_conversation = staticmethod(lambda: False)
+    select_model = staticmethod(lambda *a, **k: (True, ""))
+    last_assistant_message = staticmethod(lambda *a, **k: None)
+    read_credits = staticmethod(lambda: {"left": 100.0})
+
+
+_saved_mod = sys.modules.get("workbuddy_cdp")
+_enter_pressed = {"v": False}
+
+
+def _ed_paste_then_submit(needle):
+    """模拟真实时序：前两次调用（粘贴校验）有内容，回车后清空。
+
+    真实行为是「回车即提交」：这里用 _enter_pressed 开关来表现，
+    因为 edit send 里先校验粘贴、按回车、再校验已清空。"""
+    if _enter_pressed["v"]:
+        _editor_text["v"] = ""      # 消息已提交，输入框清空
+        return False
+    _editor_text["v"] = needle       # 粘贴成功，输入框出现内容
+    return True
+
+
+class _EdOK(_EdCDP):
+    editor_contains = staticmethod(_ed_paste_then_submit)
+
+
+# 让 _enter() 打标记：借用 core 的 window API 调用顺序不可靠，直接包一层
+_orig_enter = core._enter
+
+
+def _enter_and_mark():
+    _enter_pressed["v"] = True
+    _orig_enter()
+
+
+core._enter = _enter_and_mark
+sys.modules["workbuddy_cdp"] = _EdOK
+
+# 粘贴成功：两次校验都通过
+_editor_text["v"] = "待发送的一大段提示词内容"
+# 需要一份"刚发现且含免费模型"的目录，否则免费门控会正确地拦下发送
+_st = fresh_state()
+_st["model_catalog"] = [{"name": "FreeA", "free": True, "multiplier": 0.0}]
+stamp(_st)
+core.save_state(_st)
+_t1 = {"id": 1, "content": "待发送的一大段提示词内容", "model": "FreeA",
+       "allow_credit": False, "status": "pending", "attempts": 0}
+cfg_send = cfg_of(free_window={"enabled": True, "start": "00:00", "end": "23:59"})
+try:
+    core.send_task(_t1, cfg_send)
+except Exception as e:
+    print("  (send raised:", e, ")")
+print("  → status:", _t1.get("status"))
+check("输入框正常时能发送成功", _t1.get("status") == "sent", f"实际={_t1.get('status')}")
+
+# 粘贴后输入框仍为空：必须判失败并保留 pending，绝不能把空消息发出去
+sys.modules["workbuddy_cdp"] = _EdCDP   # 严格版：只认当前文本，粘贴根本落不进去
+_editor_text["v"] = ""
+_enter_pressed["v"] = False
+_t2 = {"id": 2, "content": "另一段要发的内容", "model": "FreeA",
+       "allow_credit": False, "status": "pending", "attempts": 0}
+try:
+    core.send_task(_t2, cfg_send)
+except Exception as e:
+    print("  (send raised:", e, ")")
+_st_after = core.load_state()
+_on_disk = next((x for x in _st_after.get("tasks", []) if x.get("id") == 2), None)
+check("粘贴未生效→任务不被标记 sent（不会静默丢消息）",
+      _t2.get("status") != "sent", f"实际={_t2.get('status')}")
+
+# 校验函数本身的行为
+check("_editor_has_text 在 CDP 在线且含内容时为真",
+      core._editor_has_text("待发送") is False, "content为空字符串时应为 False")
+_editor_text["v"] = "待发送内容"
+check("_editor_has_text 命中内容时为真", core._editor_has_text("待发送") is True)
+check("_editor_still_has_text 命中内容时为真", core._editor_still_has_text("待发送") is True)
+_editor_text["v"] = ""
+check("_editor_still_has_text 清空后为假", core._editor_still_has_text("待发送") is False)
+
+# 粘贴前必须先聚焦输入框（真实 bug：读完回复后焦点不在编辑器，Ctrl+V 落空）
+_focus_calls = {"v": 0}
+
+
+class _EdFocus(_EdOK):
+    focus_editor = staticmethod(
+        lambda: (_focus_calls.__setitem__("v", _focus_calls["v"] + 1) or True))
+
+
+sys.modules["workbuddy_cdp"] = _EdFocus
+_focus_calls["v"] = 0
+_enter_pressed["v"] = False
+_editor_text["v"] = ""
+_t3 = {"id": 3, "content": "聚焦后要发送的内容", "model": "FreeA",
+       "allow_credit": False, "status": "pending", "attempts": 0}
+try:
+    core.send_task(_t3, cfg_send)
+except Exception as e:
+    print("  (send raised:", e, ")")
+check("发送前调用了 focus_editor 聚焦输入框",
+      _focus_calls["v"] >= 1, f"调用次数={_focus_calls['v']}")
+check("聚焦修复后能正常发送成功", _t3.get("status") == "sent",
+      f"实际={_t3.get('status')}")
+
+# focus_editor 未确认聚焦（如 CDP 抖动）也不能崩溃，应降级继续尝试粘贴；
+# 只要粘贴真的落进输入框，发送仍应成功
+class _EdNoFocus(_EdOK):
+    focus_editor = staticmethod(lambda: False)
+
+
+sys.modules["workbuddy_cdp"] = _EdNoFocus
+_enter_pressed["v"] = False
+_editor_text["v"] = ""
+_t4 = {"id": 4, "content": "降级路径内容", "model": "FreeA",
+       "allow_credit": False, "status": "pending", "attempts": 0}
+try:
+    core.send_task(_t4, cfg_send)
+except Exception as e:
+    print("  (send raised:", e, ")")
+check("focus_editor=False 但粘贴成功时仍能发送",
+      _t4.get("status") == "sent", f"实际={_t4.get('status')}")
+
+core._enter = _orig_enter
+sys.modules["workbuddy_cdp"] = _saved_mod if _saved_mod else types.ModuleType("workbuddy_cdp")
+
+# ================================================================ 25b. 回归：粘贴成功+输入框清空 ≠ 已发送
+# （真实 bug：仅看“输入框清空”会把“提交被静默吞掉/消息没进对话”误判为已发送，
+#  多会话下尤其明显。修复后用 _sent_message_present_in_conversation 去对话里二次确认。）
+print("\n== 25b. 回车后消息须真正出现在对话里（防静默丢消息）==")
+
+# 负向：粘贴进了输入框、回车后输入框也清空，但对话里根本查不到这条用户消息
+# —— 旧实现会误判为已发送；修复后必须判失败、保留任务待重试。
+class _EdSentGap(_EdCDP):
+    editor_contains = staticmethod(_ed_paste_then_submit)
+    _in_conversation_page = staticmethod(lambda: True)
+    read_conversation = staticmethod(
+        lambda: [{"role": "assistant", "text": "（这是另一条会话的回复，不含刚发的内容）"}])
+    _open_conversation_by_title = staticmethod(lambda kw: False)
+
+
+# 正向对照：消息确实进入了对话（含该内容的用户气泡），应判定为已发送成功
+class _EdSentOK(_EdCDP):
+    editor_contains = staticmethod(_ed_paste_then_submit)
+    _in_conversation_page = staticmethod(lambda: True)
+    read_conversation = staticmethod(
+        lambda: [{"role": "user", "text": "回车后消息确实进入了对话的内容"},
+                 {"role": "assistant", "text": "好的，已收到"}])
+    _open_conversation_by_title = staticmethod(lambda kw: False)
+
+
+_orig_enter_b = core._enter
+
+
+def _enter_and_mark_b():
+    _enter_pressed["v"] = True
+    _orig_enter_b()
+
+
+core._enter = _enter_and_mark_b
+
+# --- 负向用例：消息未进入对话，绝不能标 sent ---
+sys.modules["workbuddy_cdp"] = _EdSentGap
+_enter_pressed["v"] = False
+_editor_text["v"] = ""
+_st["model_catalog"] = [{"name": "FreeA", "free": True, "multiplier": 0.0}]
+core.save_state(_st)
+_t_gap = {"id": 51, "content": "回车后消息并未真正进入对话的内容", "model": "FreeA",
+          "allow_credit": False, "status": "pending", "attempts": 0}
+try:
+    core.send_task(_t_gap, cfg_send)
+except Exception as e:
+    print("  (send raised:", e, ")")
+check("回归-消息不在对话里→不标 sent（防静默丢消息）",
+      _t_gap.get("status") != "sent", f"实际={_t_gap.get('status')}")
+
+# --- 正向对照：消息确实在对话里，应成功标 sent ---
+sys.modules["workbuddy_cdp"] = _EdSentOK
+_enter_pressed["v"] = False
+_editor_text["v"] = ""
+_t_ok = {"id": 52, "content": "回车后消息确实进入了对话的内容", "model": "FreeA",
+         "allow_credit": False, "status": "pending", "attempts": 0}
+try:
+    core.send_task(_t_ok, cfg_send)
+except Exception as e:
+    print("  (send raised:", e, ")")
+check("回归-消息确实在对话里→正常标 sent（不误杀）",
+      _t_ok.get("status") == "sent", f"实际={_t_ok.get('status')}")
+
+core._enter = _orig_enter_b
+sys.modules["workbuddy_cdp"] = _saved_mod if _saved_mod else types.ModuleType("workbuddy_cdp")
+
+# ================================================================ 26. 回复清洗：剥掉「深度思考」标题
+print("\n== 26. 回复清洗剥掉「深度思考」折叠标题 ==")
+_t1_in = "深度思考\n收到测试消息。"
+_t1_out = cdp._clean_reply_text(_t1_in)
+check("头部「深度思考」被剥掉", _t1_out == "收到测试消息。", f"实际={_t1_out!r}")
+_t2_in = "已深度思考（用时 3 秒）\n答案正文"
+_t2_out = cdp._clean_reply_text(_t2_in)
+check("「已深度思考（用时 3 秒）」被剥掉", _t2_out == "答案正文", f"实际={_t2_out!r}")
+check("正文中正常提到「深度思考」不影响",
+      cdp._clean_reply_text("我用了深度思考来解题") == "我用了深度思考来解题")
+check("纯正文不受影响",
+      cdp._clean_reply_text("正常回复\nHy3\n13:13") == "正常回复")
 
 # ================================================================ 汇总
 print("\n" + "=" * 56)

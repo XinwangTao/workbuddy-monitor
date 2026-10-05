@@ -1,8 +1,6 @@
-' WorkBuddy launcher: start WorkBuddy (with CDP for handle/API integration) + monitor GUI
+' WorkBuddy Monitor 一键启动入口
+' 双击本文件即可启动 PowerShell 启动器；窗口隐藏运行。
 Set sh = CreateObject("WScript.Shell")
-
-' Start WorkBuddy main program with remote debugging port (for API balance read / model select)
-sh.Run """C:\Program Files\WorkBuddy\WorkBuddy.exe"" --remote-debugging-port=9222", 1, False
-
-' Start monitor GUI (pythonw, no console window)
-sh.Run """F:\ANACONDA\1\pythonw.exe"" ""C:\Users\UserX\Documents\Codex\2026-09-09\hi\outputs\workbuddy-monitor\workbuddy_gui.py""", 0, False
+scriptPath = CreateObject("Scripting.FileSystemObject").BuildPath(CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName), "start_workbuddy.ps1")
+cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & scriptPath & """"
+sh.Run cmd, 0, False

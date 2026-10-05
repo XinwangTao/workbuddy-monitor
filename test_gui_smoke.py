@@ -93,7 +93,7 @@ check("表格有渲染行", len(app.tree.get_children()) == 1,
 check("表格含'定时'列", "scheduled" in app.tree["columns"], f"实际={app.tree['columns']}")
 
 # 迭代状态展示
-camp = core.create_campaign(core.load_state(), "冒烟迭代目标", strategy="improve")
+camp = core.create_campaign(core.load_state(), "冒烟迭代目标", strategy="autopilot")
 app.state = core.load_state()
 try:
     app.refresh_iter()
