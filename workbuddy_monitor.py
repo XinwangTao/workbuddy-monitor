@@ -2184,6 +2184,28 @@ def read_balance(cfg: dict):
 _BALANCE_STATE_KEY = "balance_guard"
 
 
+def iteration_allowed(cfg: dict, now=None, state=None) -> bool:
+    """自动迭代是否允许推进。
+
+    夜间全局免费窗口内：照常放行（与原 in_free_window 行为一致）。
+    白天（窗口外）：仅当免费目录 fresh 且存在"倍率=0 的全天免费模型"
+    （free=True 且 multiplier==0，与发送门控 free_gate_reason 的口径一致）
+    时放行；目录缺失/过期/仅收费模型一律不放行（fail-closed）。
+    安全性：复用 catalog_is_fresh / model_catalog 既有事实，不引入新的信任源。
+    """
+    if in_free_window(cfg, now, state):
+        return True
+    # 窗口外：仅接受"确凿的全天免费模型"（倍率明确为 0）
+    st = state or {}
+    if not catalog_is_fresh(st, cfg):
+        return False
+    for m in st.get("model_catalog", []) or []:
+        if m.get("free") and m.get("multiplier") == 0:
+            return True
+    return False
+
+
+
 def in_free_window(cfg: dict, now=None, state=None, model=None) -> bool:
     """判断当前时间是否在免费时段内（支持跨午夜，如 23:00-08:00）。
     state/model 提供时优先用发现到的专属窗口；否则用配置窗口。
@@ -2368,10 +2390,10 @@ def monitor_tick(cfg: dict, now=None) -> dict:
     except Exception as e:
         info["errors"].append(f"send: {e}")
         log(f"任务调度异常(已跳过本轮): {e}")
-    # ② 自动迭代（仅免费时段）
     try:
+        info["iteration_allowed"] = iteration_allowed(cfg, now, state)
         info["in_free_window"] = in_free_window(cfg, now, state)
-        if info["in_free_window"]:
+        if info["iteration_allowed"]:
             refresh_free_discovery(cfg, state)   # 目录不可信时按节流重新发现
             run_iteration_step(state, cfg, now)
             info["iterated"] = True
