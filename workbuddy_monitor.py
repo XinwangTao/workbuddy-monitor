@@ -2533,7 +2533,7 @@ def main():
     p.add_argument("--discover", action="store_true", help="从 WorkBuddy 底层发现免费模型/时段并打印")
     # 自动迭代：在免费时段内反复执行任务，每轮根据上轮结果智能生成下一步优化提示词
     p.add_argument("--iterate", metavar="GOAL", help="开启自动迭代：填入目标/初始提示词")
-    p.add_argument("--strategy", choices=ITER_STRATEGIES, default="improve",
+    p.add_argument("--strategy", choices=ITER_STRATEGIES, default="autopilot",
                    help="迭代策略: staged(自定义阶段循环)/improve(内置渐进优化)/"
                         "reflect(模型自主反思)/autopilot(下一步方向完全由模型自己决定)")
     p.add_argument("--stages", metavar="A,B,C", default="", help="staged 策略的阶段列表（逗号分隔）")
