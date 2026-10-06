@@ -16,11 +16,12 @@ if ($Remove) {
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $Root 'night_run.ps1') + '"') `
     -WorkingDirectory $Root
-$trigger = New-ScheduledTaskTrigger -Daily -At '22:45'
+$trigger = New-ScheduledTaskTrigger -Daily -At '23:05'
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 12) -MultipleInstances IgnoreNew
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Settings $settings -Principal $principal -Force | Out-Null
-Write-Output "已注册计划任务: $TaskName（每晚 22:45 启动，最长 12 小时；免费窗口外 runner 会空转退出）"
+Write-Output "已注册计划任务: $TaskName（每晚 23:05 启动（免费窗口 23:00-08:00 内），最长 12 小时；提前手动触发会等待开窗）"
+

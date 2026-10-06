@@ -26,7 +26,7 @@ except ImportError:
 
 # 优先使用 WORKBUDDY_CDP_HOST；未设置时自动探测常用端口。
 CDP_HOST = os.environ.get("WORKBUDDY_CDP_HOST", "").rstrip("/")
-CDP_PORTS = (9223, 9222)
+CDP_PORTS = (9224, 9223, 9222)
 BILLING_URL = "https://copilot.tencent.com/billing/meter/get-user-resource-summary"
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 _TOKEN_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".wb_token_cache")

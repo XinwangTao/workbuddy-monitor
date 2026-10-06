@@ -1,8 +1,13 @@
-﻿param([switch]$CheckOnly)
+﻿# start_workbuddy.ps1 - WorkBuddy 启动/CDP 保障脚本
+# 用法:
+#   start_workbuddy.ps1                 # 正常启动(GUI + WorkBuddy CDP)
+#   start_workbuddy.ps1 -CheckOnly      # 只自检,不启动任何东西
+#   start_workbuddy.ps1 -RestartForCdp  # WorkBuddy 无 CDP 时优雅重启
+param([switch]$CheckOnly, [switch]$RestartForCdp)
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogPath = Join-Path $Root 'launch.log'
-$CdpPorts = @(9223, 9222)
+$CdpPorts = @(9224, 9223, 9222)
 
 function Write-LaunchLog([string]$Message) {
     $line = "[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
@@ -83,16 +88,34 @@ try {
         Write-LaunchLog "检测到 WorkBuddy CDP，端口 $cdpPort；不重复启动 WorkBuddy。"
     } else {
         $running = Get-Process -Name WorkBuddy -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($running) {
+        if ($running -and -not $RestartForCdp) {
             Write-LaunchLog 'WorkBuddy 已运行但未发现 CDP；不重复启动，余额同步/模型发现可能不可用。'
         } else {
+            if ($running) {
+                Write-LaunchLog 'WorkBuddy 已运行但无 CDP，按 -RestartForCdp 优雅重启以启用远程调试。'
+                Get-Process -Name WorkBuddy -ErrorAction SilentlyContinue | ForEach-Object {
+                    try { $_.CloseMainWindow() | Out-Null } catch { }
+                }
+                for ($i = 0; $i -lt 10; $i++) {
+                    Start-Sleep -Seconds 1
+                    if (-not (Get-Process -Name WorkBuddy -ErrorAction SilentlyContinue)) { break }
+                }
+                # 关窗无效(例如托盘常驻)时才强杀
+                Get-Process -Name WorkBuddy -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                # 等所有进程(含子进程)完全退出,避免新实例误判旧实例仍在而放弃 CDP 端口
+                for ($i = 0; $i -lt 15; $i++) {
+                    Start-Sleep -Seconds 1
+                    if (-not (Get-Process -Name WorkBuddy -ErrorAction SilentlyContinue)) { break }
+                }
+                Start-Sleep -Seconds 3  # 缓冲,让句柄/端口彻底释放
+            }
             $exe = Find-WorkBuddyExe
             if ($exe) {
-                if ($CheckOnly) { Write-Output "Would start WorkBuddy: $exe --remote-debugging-port=9223" }
+                if ($CheckOnly) { Write-Output "Would start WorkBuddy: $exe --remote-debugging-port=9224" }
                 else {
-                    Start-Process -FilePath $exe -ArgumentList '--remote-debugging-port=9223'
-                    Write-LaunchLog "已启动 WorkBuddy（CDP 9223）：$exe"
-                    for ($i = 0; $i -lt 15 -and -not $cdpPort; $i++) { Start-Sleep -Seconds 1; $cdpPort = Find-WorkBuddyCdp }
+                    Start-Process -FilePath $exe -ArgumentList '--remote-debugging-port=9224'
+                    Write-LaunchLog "已启动 WorkBuddy（CDP 9224）：$exe"
+                    for ($i = 0; $i -lt 30 -and -not $cdpPort; $i++) { Start-Sleep -Seconds 1; $cdpPort = Find-WorkBuddyCdp }
                     if ($cdpPort) { Write-LaunchLog "WorkBuddy CDP 就绪，端口 $cdpPort。" }
                     else { Write-LaunchLog 'WorkBuddy 已启动，但 CDP 尚未就绪；监控 GUI 仍将启动。' }
                 }
@@ -109,28 +132,29 @@ try {
         Write-Output 'Check completed; no applications were started.'
         exit 0
     }
-    $guiProc = Start-Process -FilePath $pythonw -ArgumentList @('"' + $gui + '"', '--start-monitor') -WorkingDirectory $Root -PassThru
-    Write-LaunchLog "已启动监控 GUI，并自动开启监控。PID=$($guiProc.Id)"
 
-    # 就绪确认：GUI 进程可能在 import 阶段就崩溃（依赖缺失等），
-    # 这里等最多 10 秒确认进程存活，否则报错让用户知道"点了没反应"的原因。
-    $alive = $false
-    for ($i = 0; $i -lt 10; $i++) {
-        Start-Sleep -Seconds 1
-        $p = Get-Process -Id $guiProc.Id -ErrorAction SilentlyContinue
-        if ($p) { $alive = $true; break }
+    # GUI 单实例保护：已有监控 GUI 在跑时不重复启动，避免双实例重复发送
+    $existingGui = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+        Where-Object { $_.CommandLine -like "*workbuddy_gui.py*" } | Select-Object -First 1
+    if ($existingGui) {
+        Write-LaunchLog "监控 GUI 已在运行（PID=$($existingGui.ProcessId)），不重复启动。"
+    } else {
+        $guiProc = Start-Process -FilePath $pythonw -ArgumentList @('"' + $gui + '"', '--start-monitor') -WorkingDirectory $Root -PassThru
+        Write-LaunchLog "已启动监控 GUI，并自动开启监控。PID=$($guiProc.Id)"
+        # 就绪确认：GUI 进程可能在 import 阶段就崩溃（依赖缺失等），等最多 10 秒确认存活
+        $alive = $false
+        for ($i = 0; $i -lt 10; $i++) {
+            Start-Sleep -Seconds 1
+            if (Get-Process -Id $guiProc.Id -ErrorAction SilentlyContinue) { $alive = $true; break }
+        }
+        if (-not $alive) {
+            Write-LaunchLog '监控 GUI 启动后立即退出（可能缺少依赖或端口占用），请查看 monitor.log'
+            exit 1
+        }
+        Write-LaunchLog '监控 GUI 已就绪。'
     }
-    if (-not $alive) {
-        Write-LaunchLog '监控 GUI 启动后立即退出（可能缺少依赖或端口占用），请查看 monitor.log'
-        Add-Type -AssemblyName PresentationFramework
-        [System.Windows.MessageBox]::Show(
-            "监控界面启动后立即退出了。`n`n常见原因：`n1) 缺少依赖（tornado/requests）`n2) 端口被占用`n`n请查看 launch.log 与 monitor.log。",
-            'WorkBuddy Monitor 启动异常', 'OK', 'Warning') | Out-Null
-        exit 1
-    }
-    Write-LaunchLog '监控 GUI 已就绪。'
 
-    # 启动后自检摘要（只读，不发送任何对话）：把免费模型/时段/活跃迭代写入 launch.log
+    # 启动后自检摘要（只读，不发送任何对话）
     try {
         $py = Join-Path (Split-Path -Parent $pythonw) 'python.exe'
         if (Test-Path -LiteralPath $py) {
@@ -142,7 +166,6 @@ try {
     }
 } catch {
     Write-LaunchLog "启动失败：$($_.Exception.Message)"
-    Add-Type -AssemblyName PresentationFramework
-    [System.Windows.MessageBox]::Show($_.Exception.Message, 'WorkBuddy Monitor 启动失败', 'OK', 'Error') | Out-Null
     exit 1
 }
+
