@@ -2060,6 +2060,29 @@ finally:
             except Exception:
                 pass
 
+# ================================================================ 32. next_free_window 免费时段倒计时（零覆盖）
+print("\n=== 32. next_free_window 免费时段倒计时（零覆盖）===")
+_cfg32 = {"auto_send": {"free_window": {"start": "23:00"}}}
+# (1) 当前在窗口前 → 返回今天的 start
+_now_before = datetime(2026, 11, 5, 10, 0, 0)
+_n1 = core.next_free_window(_cfg32, state=None, now=_now_before)
+check("窗口前→返回今天 start", _n1 == datetime(2026, 11, 5, 23, 0, 0),
+      f"实际={_n1}")
+# (2) 当前已过 start → 返回次日 start（跨天滚动），避免倒计时卡在已过的时刻
+_now_after = datetime(2026, 11, 5, 23, 30, 0)
+_n2 = core.next_free_window(_cfg32, state=None, now=_now_after)
+check("已过 start→返回次日 start（跨天滚动）",
+      _n2 == datetime(2026, 11, 6, 23, 0, 0), f"实际={_n2}")
+# (2b) 边界：恰好等于 start 时刻（now >= start 成立）→ 同样滚到次日
+_now_eq = datetime(2026, 11, 5, 23, 0, 0)
+_n2b = core.next_free_window(_cfg32, state=None, now=_now_eq)
+check("等于 start 时刻→滚到次日", _n2b == datetime(2026, 11, 6, 23, 0, 0),
+      f"实际={_n2b}")
+# (3) 非法 start → None（map(int) 阶段抛 ValueError 被捕获，不崩溃）
+_cfg_bad = {"auto_send": {"free_window": {"start": "abc"}}}
+_n3 = core.next_free_window(_cfg_bad, state=None, now=_now_before)
+check("非法 start→None（不崩溃）", _n3 is None, f"实际={_n3}")
+
 # ================================================================ 汇总
 print("\n" + "=" * 56)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")
