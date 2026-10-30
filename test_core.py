@@ -2108,6 +2108,32 @@ check("③ 未来重置→保留",
       "Future" in _after33, f"实际={list(_after33.keys())}")
 fresh_state()  # 收尾：还原干净状态，避免污染全局 state 文件
 
+# ================================================================ 34. verify_no_credit_charge 余额守卫（零覆盖）
+print("\n=== 34. verify_no_credit_charge 余额守卫（零覆盖）===")
+_orig_rb = core.read_balance
+_orig_alert = core.show_alert_popup
+core.show_alert_popup = lambda *a, **k: None  # 桩掉真实 GUI 弹窗，避免测试中卡死
+try:
+    # (1) 发送前没读到余额 → True（不误报）
+    check("before=None→True(不误报)", core.verify_no_credit_charge({}, None, 1) is True)
+    # (2) 发送后读不到余额 → True（无法判断，跳过校验）
+    core.read_balance = lambda cfg: None
+    check("读不到余额→True(跳过校验)", core.verify_no_credit_charge({}, 100.0, 1) is True)
+    # (3) 余额下降 → False 且触发守卫暂停
+    core.read_balance = lambda cfg: 95.0
+    _ok34 = core.verify_no_credit_charge({}, 100.0, 1)
+    check("余额下降→False(已触发暂停)", _ok34 is False)
+    check("余额下降→余额守卫已暂停", core.balance_guard_paused(core.load_state()) is True)
+    # (4) 余额持平 → True（无扣费）
+    core.read_balance = lambda cfg: 100.0
+    check("余额持平→True(无扣费)", core.verify_no_credit_charge({}, 100.0, 1) is True)
+finally:
+    # 收尾：还原桩与守卫状态，避免污染全局
+    core.read_balance = _orig_rb
+    core.show_alert_popup = _orig_alert
+    core.set_balance_guard_paused(None, False, "test cleanup")
+    fresh_state()
+
 # ================================================================ 汇总
 print("\n" + "=" * 56)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")
