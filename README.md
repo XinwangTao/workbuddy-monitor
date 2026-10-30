@@ -179,6 +179,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File create_shortcut.ps1
 
 活动状态保存在 `state.json` 的 `campaigns` 字段，下一夜会自动从断点继续。
 
+### 迭代会话复用（conversation_reuse）
+
+迭代活动从第 2 轮起**复用同一会话**，而不是每轮都新建——这样模型才能看到自己上一轮的回复与 `[[NEXT]]`，迭代才是真正的连续自主决策；首轮 / 普通任务 / 无匹配活动仍走「新建会话」旧行为。
+
+- **复用判定**（`conversation_reuse_for_task`）：存在一个 `running` 活动，其 `last_task_id` 或 `history` 中某条的 `task_id` 命中当前任务，**且** `current_iteration >= 1` → 复用；否则（首轮 / 普通任务 / 无匹配活动）→ 新建会话。
+- **发送路径护栏**：`reuse=True` 时短路、不调 `start_new_conversation()`——既不新建会话、也不重选模型。这正好避开「发送可靠性」里那条真实事故：新会话会把模型重置成默认 Deepseek-V4.1-Flash，导致 Hy3 任务白扣 9.17 积分；复用沿用上轮已选好的免费模型，计费模型本就正确。
+- **回归覆盖**：`test_core.py` section 28（复用判定：`last_task_id` / `history.task_id` 命中、非 `running` 不复用）+ section 29（`reuse=True` 时 `start_new_conversation` 调用数 = 0，钉住「不污染历史会话计费」）。
+
 ## 🖼 界面预览
 
 - 限流状态区：显示被限流模型、重置时间、剩余倒计时
