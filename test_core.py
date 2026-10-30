@@ -1909,6 +1909,69 @@ check("非 running 活动 -> 不复用",
       core.conversation_reuse_for_task(444, st28) is False,
       f"实际={core.conversation_reuse_for_task(444, st28)!r}")
 
+# ================================================================ 29. 发送复用分支 CDP 集成回归
+print("\n== 29. auto_send_to_workbuddy reuse_conversation 分支集成回归 ==")
+# 伪造 CDP：记录 start_new_conversation / focus_editor 调用次数；insert 走 CDP 注入路径
+_calls29 = {"new": 0, "focus": 0}
+_reuse_cdp_mod = types.ModuleType("workbuddy_cdp")
+_reuse_cdp_mod.is_workbuddy_running = lambda: True
+_reuse_cdp_mod.start_new_conversation = lambda: (_calls29.__setitem__("new", _calls29["new"] + 1) or True)
+_reuse_cdp_mod.focus_editor = lambda: (_calls29.__setitem__("focus", _calls29["focus"] + 1) or True)
+_reuse_cdp_mod.select_model = lambda *a, **k: (True, "")
+_reuse_cdp_mod.insert_text_into_editor = lambda *a, **k: True
+_reuse_cdp_mod.editor_contains = lambda *a, **k: False
+
+_saved_cdp29 = sys.modules.get("workbuddy_cdp")
+_saved_fns29 = {}
+for _n in ("set_clipboard_text", "_get_clipboard_text", "_find_window_by_title",
+           "_activate_window", "_enter", "_editor_has_text", "_editor_still_has_text",
+           "_clear_editor_leftover", "_sent_message_present_in_conversation"):
+    if hasattr(core, _n):
+        _saved_fns29[_n] = getattr(core, _n)
+
+
+class _U32:
+    def GetForegroundWindow(self):
+        return 1
+
+
+core.user32 = _U32()
+core.set_clipboard_text = lambda t: True
+core._get_clipboard_text = lambda: ""
+core._find_window_by_title = lambda s: 1
+core._activate_window = lambda h: True
+core._enter = lambda: None
+core._editor_has_text = lambda n: False
+core._editor_still_has_text = lambda n: False
+core._clear_editor_leftover = lambda n: True
+core._sent_message_present_in_conversation = lambda c, tries=6: True
+_real_sleep29 = core.time.sleep
+core.time.sleep = lambda *a, **k: None
+sys.modules["workbuddy_cdp"] = _reuse_cdp_mod
+try:
+    # 复用分支：绝不能调 start_new_conversation，否则会新建会话、重置模型计费（真实事故）
+    _calls29["new"] = 0
+    _calls29["focus"] = 0
+    ok_r, msg_r = core.auto_send_to_workbuddy("复用这条消息", reuse_conversation=True)
+    check("reuse=True 发送成功", ok_r is True, f"msg={msg_r}")
+    check("reuse=True 不调 start_new_conversation（复用而非新建，避免污染计费）",
+          _calls29["new"] == 0, f"start_new_conversation 调用={_calls29['new']}")
+    check("reuse=True 仍聚焦输入框", _calls29["focus"] >= 1, f"focus 调用={_calls29['focus']}")
+
+    # 对照：非复用分支必须新建会话
+    _calls29["new"] = 0
+    _calls29["focus"] = 0
+    ok_n, msg_n = core.auto_send_to_workbuddy("新建这条消息", reuse_conversation=False)
+    check("reuse=False 发送成功", ok_n is True, f"msg={msg_n}")
+    check("reuse=False 调 start_new_conversation（新建会话）",
+          _calls29["new"] == 1, f"start_new_conversation 调用={_calls29['new']}")
+    check("reuse=False 也聚焦输入框", _calls29["focus"] >= 1, f"focus 调用={_calls29['focus']}")
+finally:
+    sys.modules["workbuddy_cdp"] = _saved_cdp29
+    for _n, _f in _saved_fns29.items():
+        setattr(core, _n, _f)
+    core.time.sleep = _real_sleep29
+
 # ================================================================ 汇总
 print("\n" + "=" * 56)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")
