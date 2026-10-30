@@ -2025,6 +2025,41 @@ finally:
     for _n, _f in _saved30.items():
         setattr(core, _n, _f)
 
+# ================================================================ 31. check_rate_limits 离线回归
+print("\n== 31. check_rate_limits 限流写入 + 24h 陈旧保护 ==")
+import tempfile as _tf31, os as _os31
+_f31a = _f31b = None
+_saved_save31 = core.save_state
+core.save_state = lambda *a, **k: None  # 不污染真实 state.json
+try:
+    # (1) 未来重置时间的限流消息应写入 state['rate_limits']
+    st31 = {"rate_limits": {}}
+    _f31a = _tf31.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
+    _f31a.write("您在 Hy4preview 模型的使用量已超出频率限制，可在 2027-01-01 08:00:00 重置可用")
+    _f31a.close()
+    core.check_rate_limits(st31, {"watch_file": _f31a.name})
+    _got31 = st31["rate_limits"].get("Hy4preview")
+    check("check_rate_limits 写入未来重置的限流记录", _got31 is not None, f"rate_limits={st31['rate_limits']!r}")
+    check("写入记录含 reset 字段", bool(_got31 and _got31.get("reset")),
+          f"reset={_got31.get('reset') if _got31 else None!r}")
+
+    # (2) 重置时间已过 24h 的陈旧消息应被忽略(不写入)，避免旧剪贴板误触发自动发送
+    st31b = {"rate_limits": {}}
+    _f31b = _tf31.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
+    _f31b.write("您在 Hy4preview 模型的使用量已超出频率限制，可在 2026-01-01 08:00:00 重置可用")
+    _f31b.close()
+    core.check_rate_limits(st31b, {"watch_file": _f31b.name})
+    check("陈旧(>24h)限流消息被忽略不写入",
+          "Hy4preview" not in st31b["rate_limits"], f"rate_limits={st31b['rate_limits']!r}")
+finally:
+    core.save_state = _saved_save31
+    for _p in (_f31a, _f31b):
+        if _p is not None:
+            try:
+                _os31.remove(_p.name)
+            except Exception:
+                pass
+
 # ================================================================ 汇总
 print("\n" + "=" * 56)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")
