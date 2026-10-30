@@ -2083,6 +2083,31 @@ _cfg_bad = {"auto_send": {"free_window": {"start": "abc"}}}
 _n3 = core.next_free_window(_cfg_bad, state=None, now=_now_before)
 check("非法 start→None（不崩溃）", _n3 is None, f"实际={_n3}")
 
+# ================================================================ 33. _cleanup_rate_limits 限流记录清理（零覆盖）
+print("\n=== 33. _cleanup_rate_limits 限流记录清理（零覆盖）===")
+# 三类限流记录：① 重置已过且无可待发 → 应清除；② 重置已过但有 pending 任务 → 应保留；
+# ③ 重置在未来 → 应保留。
+st33 = fresh_state()
+_past = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+_fut = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+st33["rate_limits"] = {
+    "OldNoPending": {"model": "Hy4preview", "reset": _past, "source": "watch"},
+    "OldWithPending": {"model": "Hy3", "reset": _past, "source": "watch"},
+    "Future": {"model": "Hy4preview", "reset": _fut, "source": "watch"},
+}
+# 一条 pending 任务(model=Hy3) → 保护 OldWithPending 不被清
+st33["tasks"] = [{"id": 901, "model": "Hy3", "status": "pending", "content": "x"}]
+core.save_state(st33)
+core._cleanup_rate_limits(cfg=None)
+_after33 = core.load_state().get("rate_limits", {})
+check("① 过去+无待发→已清除",
+      "OldNoPending" not in _after33, f"实际={list(_after33.keys())}")
+check("② 过去+有待发→保留(不误删进行中限流)",
+      "OldWithPending" in _after33, f"实际={list(_after33.keys())}")
+check("③ 未来重置→保留",
+      "Future" in _after33, f"实际={list(_after33.keys())}")
+fresh_state()  # 收尾：还原干净状态，避免污染全局 state 文件
+
 # ================================================================ 汇总
 print("\n" + "=" * 56)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")
