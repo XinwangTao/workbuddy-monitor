@@ -1787,8 +1787,23 @@ def _editor_has_text(needle: str) -> bool:
         return True
 
 
+def conversation_reuse_for_task(task_id, state) -> bool:
+    """该任务是否应复用已有会话(迭代活动第2轮起= True)。
+
+    迭代活动只有延续同一会话,模型才能看到自己上一轮的回复与 [[NEXT]],
+    迭代才是真正的连续自主决策;首第1轮/普通任务/无活动 → 新建会话(旧行为)。
+    """
+    tid = task_id
+    for c in (state or {}).get("campaigns", []) or []:
+        if c.get("status") != "running":
+            continue
+        if c.get("last_task_id") == tid or tid in [h.get("task_id") for h in (c.get("history") or [])]:
+            return c.get("current_iteration", 0) >= 1
+    return False
+
+
 def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
-                           model: str = "") -> tuple:
+                           model: str = "", reuse_conversation: bool = False) -> tuple:
     """复制到剪贴板 → 激活 WorkBuddy → 粘贴 → 回车发送。
 
     返回 (ok, message)。发送后会校验「输入框已清空」或「对话里出现本轮内容」，
@@ -1830,9 +1845,8 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
         import workbuddy_cdp
         if workbuddy_cdp.is_workbuddy_running():
             try:
-                if workbuddy_cdp.start_new_conversation():
-                    log("已回新建任务页，消息不会污染历史会话")
-                else:
+                if reuse_conversation or workbuddy_cdp.start_new_conversation():
+                    log("复用迭代会话" if reuse_conversation else "已回新建任务页，消息不会污染历史会话")
                     log("警告：未能确认新建任务页（可能无 CDP 或按钮未命中），继续发送")
             except Exception as e2:
                 log(f"新建会话步骤异常（忽略）: {e2}")
@@ -2050,8 +2064,8 @@ def send_task(task: dict, cfg: dict):
                     return
             ok, msg = auto_send_to_workbuddy(task["content"],
                                              auto.get("window_title", "WorkBuddy"),
-                                             model=want_model)
-            log(f"自动发送结果(第{attempts+1}次): {msg}")
+                                             model=want_model,
+                                             reuse_conversation=conversation_reuse_for_task(task["id"], load_state()))
             if not ok:
                 attempts += 1
                 if attempts >= 3:

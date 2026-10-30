@@ -1875,6 +1875,40 @@ check("夜间 runner 结束后无 running 活动（autopilot 活动已创建）"
 check("夜间 runner 创建了迭代活动",
       any(c.get("goal") == "夜间测试目标" for c in core.ensure_campaigns(core.load_state())))
 
+# ================================================================ 28. 迭代会话复用判定
+print("\n== 28. 迭代会话复用判定 conversation_reuse_for_task ==")
+st28 = fresh_state()
+st28["campaigns"] = [{
+    "id": 1, "status": "running", "current_iteration": 0,
+    "last_task_id": 111, "history": [],
+}]
+check("第1轮任务 -> 新建会话(不复用)",
+      core.conversation_reuse_for_task(111, st28) is False,
+      f"实际={core.conversation_reuse_for_task(111, st28)!r}")
+_camp28 = st28["campaigns"][0]
+_camp28["current_iteration"] = 1
+_camp28["last_task_id"] = 222
+check("第2轮任务 -> 复用会话",
+      core.conversation_reuse_for_task(222, st28) is True,
+      f"实际={core.conversation_reuse_for_task(222, st28)!r}")
+check("非活动任务 -> 不复用",
+      core.conversation_reuse_for_task(999, st28) is False,
+      f"实际={core.conversation_reuse_for_task(999, st28)!r}")
+check("无活动状态 -> 不复用",
+      core.conversation_reuse_for_task(222, {}) is False,
+      f"实际={core.conversation_reuse_for_task(222, {})!r}")
+# history[].task_id 也能命中（即便 last_task_id 已变）——迭代活动靠它延续会话
+_camp28["last_task_id"] = 333
+_camp28["history"] = [{"task_id": 444, "role": "user", "text": "x"}]
+check("history.task_id 命中 -> 复用会话",
+      core.conversation_reuse_for_task(444, st28) is True,
+      f"实际={core.conversation_reuse_for_task(444, st28)!r}")
+# 非 running 状态的活动不命中
+_camp28["status"] = "done"
+check("非 running 活动 -> 不复用",
+      core.conversation_reuse_for_task(444, st28) is False,
+      f"实际={core.conversation_reuse_for_task(444, st28)!r}")
+
 # ================================================================ 汇总
 print("\n" + "=" * 56)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")
