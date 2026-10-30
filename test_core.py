@@ -276,8 +276,9 @@ check("无目录→原因说明缺目录", "尚无免费模型目录" in core.fr
 st_rl = fresh_state()
 st_rl["model_catalog"] = [{"name": "FreeA", "free": True}]
 st_rl["free_info"] = {"models_discovered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+# reset 相对校验时刻 t_at(2) 起算 1 小时之后 → 此刻确实处于限流中（确定性，不再依赖 wall-clock）
 st_rl["rate_limits"] = {"FreeA": {"model": "FreeA",
-                                  "reset": (datetime.now() + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")}}
+                                  "reset": (t_at(2) + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")}}
 check("限流中→不可发", core.is_model_free_now("FreeA", st_rl, cfg, t_at(2)) is False)
 check("限流→原因含重置时间", "限流" in core.free_gate_reason("FreeA", st_rl, cfg, t_at(2)))
 
