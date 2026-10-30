@@ -1912,12 +1912,12 @@ check("非 running 活动 -> 不复用",
 # ================================================================ 29. 发送复用分支 CDP 集成回归
 print("\n== 29. auto_send_to_workbuddy reuse_conversation 分支集成回归 ==")
 # 伪造 CDP：记录 start_new_conversation / focus_editor 调用次数；insert 走 CDP 注入路径
-_calls29 = {"new": 0, "focus": 0}
+_calls29 = {"new": 0, "focus": 0, "select": 0}
 _reuse_cdp_mod = types.ModuleType("workbuddy_cdp")
 _reuse_cdp_mod.is_workbuddy_running = lambda: True
 _reuse_cdp_mod.start_new_conversation = lambda: (_calls29.__setitem__("new", _calls29["new"] + 1) or True)
 _reuse_cdp_mod.focus_editor = lambda: (_calls29.__setitem__("focus", _calls29["focus"] + 1) or True)
-_reuse_cdp_mod.select_model = lambda *a, **k: (True, "")
+_reuse_cdp_mod.select_model = lambda *a, **k: (_calls29.__setitem__("select", _calls29["select"] + 1) or (True, ""))
 _reuse_cdp_mod.insert_text_into_editor = lambda *a, **k: True
 _reuse_cdp_mod.editor_contains = lambda *a, **k: False
 
@@ -1949,23 +1949,29 @@ _real_sleep29 = core.time.sleep
 core.time.sleep = lambda *a, **k: None
 sys.modules["workbuddy_cdp"] = _reuse_cdp_mod
 try:
-    # 复用分支：绝不能调 start_new_conversation，否则会新建会话、重置模型计费（真实事故）
+    # 复用分支：绝不能调 start_new_conversation / select_model，否则会新建会话、重置模型计费（真实事故）
     _calls29["new"] = 0
     _calls29["focus"] = 0
+    _calls29["select"] = 0
     ok_r, msg_r = core.auto_send_to_workbuddy("复用这条消息", reuse_conversation=True)
     check("reuse=True 发送成功", ok_r is True, f"msg={msg_r}")
     check("reuse=True 不调 start_new_conversation（复用而非新建，避免污染计费）",
           _calls29["new"] == 0, f"start_new_conversation 调用={_calls29['new']}")
     check("reuse=True 仍聚焦输入框", _calls29["focus"] >= 1, f"focus 调用={_calls29['focus']}")
+    check("reuse=True 不重选模型（沿用上轮已选免费模型，避开计费重置事故）",
+          _calls29["select"] == 0, f"select_model 调用={_calls29['select']}")
 
-    # 对照：非复用分支必须新建会话
+    # 对照：非复用分支必须新建会话并重选模型
     _calls29["new"] = 0
     _calls29["focus"] = 0
-    ok_n, msg_n = core.auto_send_to_workbuddy("新建这条消息", reuse_conversation=False)
+    _calls29["select"] = 0
+    ok_n, msg_n = core.auto_send_to_workbuddy("新建这条消息", reuse_conversation=False, model="FreeA")
     check("reuse=False 发送成功", ok_n is True, f"msg={msg_n}")
     check("reuse=False 调 start_new_conversation（新建会话）",
           _calls29["new"] == 1, f"start_new_conversation 调用={_calls29['new']}")
     check("reuse=False 也聚焦输入框", _calls29["focus"] >= 1, f"focus 调用={_calls29['focus']}")
+    check("reuse=False 重选模型（新会话默认模型需重选，避开计费重置事故）",
+          _calls29["select"] == 1, f"select_model 调用={_calls29['select']}")
 finally:
     sys.modules["workbuddy_cdp"] = _saved_cdp29
     for _n, _f in _saved_fns29.items():
