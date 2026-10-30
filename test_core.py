@@ -1978,6 +1978,53 @@ finally:
         setattr(core, _n, _f)
     core.time.sleep = _real_sleep29
 
+# ================================================================ 30. send_task 将 reuse 透传给 auto_send_to_workbuddy
+print("\n== 30. send_task 将 reuse_conversation 透传给 auto_send_to_workbuddy ==")
+_sent30 = {}
+
+
+def _auto_send_stub30(content, window_title="WorkBuddy", model="", reuse_conversation=False):
+    _sent30["content"] = content
+    _sent30["reuse"] = reuse_conversation
+    return True, "ok"
+
+
+_saved30 = {}
+for _n in ("send_windows_notification", "is_model_free_now", "free_gate_reason",
+           "read_balance", "load_state", "update_task", "save_state",
+           "conversation_reuse_for_task", "auto_send_to_workbuddy"):
+    if hasattr(core, _n):
+        _saved30[_n] = getattr(core, _n)
+core.send_windows_notification = lambda *a, **k: None
+core.is_model_free_now = lambda *a, **k: True
+core.free_gate_reason = lambda *a, **k: ""
+core.read_balance = lambda *a, **k: None
+core.load_state = lambda *a, **k: {"tasks": [], "campaigns": []}
+core.update_task = lambda *a, **k: None
+core.save_state = lambda *a, **k: None
+core.auto_send_to_workbuddy = _auto_send_stub30
+try:
+    # reuse 命中 -> 透传 True（沿用上轮会话，避开计费重置）
+    core.conversation_reuse_for_task = lambda *a, **k: True
+    _sent30.clear()
+    core.send_task({"id": 901, "content": "reuse 命中消息", "model": "", "status": "pending"},
+                   {"send_mode": "notify", "auto_send": {"enabled": True, "free_only": True, "balance_guard": True}})
+    check("send_task reuse 命中时透传 reuse_conversation=True",
+          _sent30.get("reuse") is True, f"reuse={_sent30.get('reuse')!r}")
+    check("send_task 透传了正确内容",
+          _sent30.get("content") == "reuse 命中消息", f"content={_sent30.get('content')!r}")
+
+    # reuse 未命中 -> 透传 False（走新建会话旧行为）
+    core.conversation_reuse_for_task = lambda *a, **k: False
+    _sent30.clear()
+    core.send_task({"id": 902, "content": "reuse 未命中消息", "model": "", "status": "pending"},
+                   {"send_mode": "notify", "auto_send": {"enabled": True, "free_only": True, "balance_guard": True}})
+    check("send_task reuse 未命中时透传 reuse_conversation=False",
+          _sent30.get("reuse") is False, f"reuse={_sent30.get('reuse')!r}")
+finally:
+    for _n, _f in _saved30.items():
+        setattr(core, _n, _f)
+
 # ================================================================ 汇总
 print("\n" + "=" * 56)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")
