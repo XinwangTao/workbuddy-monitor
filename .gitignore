@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 launch.log
 .state.lock
+night-orchestrator.lock
 .wb_token_cache
 monitor.old.log
 campaign_reply.txt

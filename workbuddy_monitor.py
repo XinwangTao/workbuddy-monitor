@@ -69,6 +69,10 @@ DEFAULT_CONFIG = {
     # "拉不起 WorkBuddy → 免费目录过期 → 活动暂停 → 整夜空转"。
     "night_preflight": True,
     "night_preflight_timeout": 300,
+    # 夜间自迭代默认绑定的仓库与验证命令（活动自身为空时回填）
+    "night_repo_path": "",
+    "night_test_cmd": "python test_core.py",
+    "verify_timeout": 900,
     # Windows 通知标题
     "notify_title": "WorkBuddy 监控",
     # 到点自动发送到 WorkBuddy 窗口（复制到剪贴板 + 粘贴 + 回车）
@@ -970,6 +974,94 @@ def pending_tasks(state: dict, model: str = ""):
 
 TASK_CLAIM_TTL = 120  # 秒：发送认领的过期时间（防进程崩溃后任务永久卡住）
 
+# ---------------------------------------------------------------------------
+# 夜间决策者单实例锁
+# ---------------------------------------------------------------------------
+# GUI 监控线程与夜间 runner 都会调 monitor_tick → run_iteration_step。
+# 没有单决策者时，两个进程会同时捕获同一回复、各自追加 history/入队下一轮，
+# 造成重复轮次与丢更新。这里用 PID 文件实现跨进程租约：runner 拿锁，
+# GUI 发现他人持锁时只观察、不发送、不推进。
+ORCH_LOCK_FILE = BASE_DIR / "night-orchestrator.lock"
+ORCH_LOCK_STALE_HOURS = 12
+_ORCH_LOCK_PID = {"pid": 0}
+_LAST_OBSERVE_LOG = {"at": 0.0}
+
+
+def _pid_alive(pid) -> bool:
+    """进程是否仍存活（Windows；取不到时按不存活处理，允许接管过期锁）。"""
+    try:
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+        if h:
+            k.CloseHandle(h)
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def acquire_orchestrator_lock(path=None) -> dict:
+    """获取夜间决策者锁；返回 token；已有存活决策者时返回 None。
+
+    同进程重复获取视为可重入（返回带 reentrant 的 token）。
+    过期/进程已死的锁会被接管，避免崩溃后永久锁死。"""
+    p = Path(path or ORCH_LOCK_FILE)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for _ in range(2):
+        try:
+            fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "started": now}, f)
+            _ORCH_LOCK_PID["pid"] = os.getpid()
+            return {"path": str(p), "pid": os.getpid()}
+        except FileExistsError:
+            info = {}
+            try:
+                info = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            pid = int(info.get("pid") or 0)
+            started = float(info.get("started") or 0)
+            if pid and pid == os.getpid():
+                _ORCH_LOCK_PID["pid"] = os.getpid()
+                return {"path": str(p), "pid": os.getpid(), "reentrant": True}
+            alive = (pid and _pid_alive(pid)
+                     and (now - started) < ORCH_LOCK_STALE_HOURS * 3600)
+            if alive:
+                return None
+            try:
+                p.unlink()
+            except Exception:
+                return None
+            continue
+    return None
+
+
+def release_orchestrator_lock(token) -> None:
+    """释放自己持有的锁；只删自己 PID 的锁文件，绝不误删别人的。"""
+    try:
+        p = Path((token or {}).get("path") or ORCH_LOCK_FILE)
+        info = json.loads(p.read_text(encoding="utf-8"))
+        if int(info.get("pid") or 0) == os.getpid():
+            p.unlink()
+    except Exception:
+        pass
+    finally:
+        _ORCH_LOCK_PID["pid"] = 0
+
+
+def _external_orchestrator_active() -> bool:
+    """是否有其他存活进程正持有决策者锁（过期锁不算）。"""
+    try:
+        info = json.loads(Path(ORCH_LOCK_FILE).read_text(encoding="utf-8"))
+        pid = int(info.get("pid") or 0)
+        started = float(info.get("started") or 0)
+        return bool(pid and pid != os.getpid() and _pid_alive(pid)
+                    and (time.time() - started) < ORCH_LOCK_STALE_HOURS * 3600)
+    except Exception:
+        return False
+
 
 def _task_created_dt(t):
     """任务创建时间；缺失/非法返回 None（这类任务不参与按时间归档）。"""
@@ -1191,6 +1283,61 @@ def _repo_has_code_change(repo):
         return None
 
 
+def _git_head(repo) -> str:
+    """仓库当前 HEAD；非 git/失败返回空串。"""
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo),
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _verify_repo_round(camp, cfg):
+    """独立验证本轮：监控器自己跑测试命令，并检查是否产生新 commit。
+
+    返回 (ok, 可读原因, evidence)。这是"这一轮算不算成功"的最终判据——
+    不再依赖模型在回复里是否写了"失败/通过"。
+    有效轮标准（按确认的默认）：测试退出码 0 且 HEAD 前进。
+    """
+    repo = (camp.get("repo_path") or cfg.get("night_repo_path") or "").strip()
+    if not repo or not Path(repo).is_dir() or not (Path(repo) / ".git").exists():
+        return True, "未绑定 git 仓库，跳过独立验证", {"skipped": True}
+    cmd = (camp.get("test_cmd") or cfg.get("night_test_cmd")
+           or "python -m py_compile *.py").strip()
+    try:
+        timeout = int(cfg.get("verify_timeout", 900))
+    except (TypeError, ValueError):
+        timeout = 900
+    head_before = (camp.get("head_before") or "").strip()
+    head_after = _git_head(repo)
+    committed = bool(head_before and head_after and head_before != head_after)
+    t0 = time.time()
+    try:
+        r = subprocess.run(cmd, cwd=repo, shell=True,
+                           capture_output=True, text=True, timeout=timeout)
+        code = r.returncode
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+    except Exception as e:
+        code = -1
+        out = f"验证命令异常: {e}"
+    ok = (code == 0 and committed)
+    if code != 0:
+        reason = f"测试未通过（exit={code}）"
+    elif not committed:
+        reason = "测试通过但没有新 commit（HEAD 未前进）"
+    else:
+        reason = "测试通过且已提交"
+    ev = {
+        "ok": ok, "exit_code": code, "committed": committed,
+        "head_before": head_before, "head_after": head_after,
+        "cmd": cmd, "seconds": round(time.time() - t0, 1),
+        "output": out[-1500:],
+        "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return ok, reason + (f"；输出节选：{out[-300:]}" if out else ""), ev
+
+
 def ensure_campaigns(state):
     state.setdefault("campaigns", [])
     for c in state["campaigns"]:
@@ -1204,6 +1351,9 @@ def ensure_campaigns(state):
         c.setdefault("no_code_change_count", 0)
         c.setdefault("last_prompt", "")
         c.setdefault("last_result", "")
+        c.setdefault("last_verify", {})
+        c.setdefault("last_verify_ok", None)
+        c.setdefault("head_before", "")
         c.setdefault("stages", [])
         c.setdefault("pause_reason", "")
         c.setdefault("paused_at", "")
@@ -1319,7 +1469,9 @@ def generate_next_prompt(camp, state):
     """根据当前状态生成下一步优化提示词。返回 (prompt, label) 或 None（活动应结束）。"""
     it = camp["current_iteration"] + 1  # 本轮是第几轮
     last = camp.get("last_result", "")
-    failed = _looks_failed(last)
+    # 独立验证结论优先；只有未跑验证的旧路径才退回关键词启发式
+    failed = (camp.get("last_verify_ok") is False) or (
+        camp.get("last_verify_ok") is None and _looks_failed(last))
     goal = camp.get("goal", "")
     ctx = f"项目目标：{goal}\n" if goal else ""
     base = (f"{ctx}这是第 {it} 轮自主迭代。请直接动手改进并给出结果"
@@ -1477,14 +1629,18 @@ def _apply_code_tail(prompt, camp, label):
         f"1) 先用工具读取相关源文件，理解现状；\n"
         f"2) 直接修改对应文件（新增/修复/重构），确保改动可运行、不破坏现有功能；\n"
         f"3) 运行验证命令确认无回归：\n    {test_cmd}\n"
-        f"4) 简短汇报：改了哪些文件、改了什么、验证结果（通过/失败）。\n"
+        f"4) 完成后必须提交：git add -A && git commit -m \"<改了什么>——<为什么>; 测试通过数\"；\n"
+        f"5) 简短汇报：改了哪些文件、改了什么、验证结果（通过/失败）。\n"
         f"只做与本轮方向相关的一件关键改动，做到位即可。"
     )
     return prompt + tail
 
 
-def advance_campaign(camp, result, state):
+def advance_campaign(camp, result, state, verify_ok=None):
     """收到一次迭代结果后推进：记录历史、轮次+1、错误计数、停止条件判定。
+
+    verify_ok: 独立验证结论。None=未跑验证（沿用关键词启发式，兼容旧路径）；
+    True/False=以验证结果为准——这是"这一轮算不算成功"的最终判据。
 
     并发安全：内部按 id 把本活动的字段合并回磁盘最新状态，
     而不是整体 save_state(调用方视图) —— 否则会覆盖掉其他进程/GUI 新建的活动
@@ -1517,13 +1673,15 @@ def advance_campaign(camp, result, state):
     camp["stage_index"] = (camp["stage_index"] + 1) % max(1, len(stages))
     camp["awaiting_result"] = False
     camp["last_task_id"] = None
-    if _looks_failed(result):
+    # 独立验证优先：有验证结论时不再用关键词猜“失败”
+    failed = (not verify_ok) if verify_ok is not None else _looks_failed(result)
+    if failed:
         camp["error_count"] = camp.get("error_count", 0) + 1
     else:
         camp["error_count"] = 0
-    # 停滞检测增强：repo 模式检测"多轮只说话不改代码"
+    # 停滞检测增强：repo 模式检测"多轮只说话不改代码"（仅在没跑独立验证时兜底）
     repo = camp.get("repo_path")
-    if repo and not _looks_failed(result):
+    if verify_ok is None and repo and not failed:
         changed = _repo_has_code_change(repo)
         if changed is False:
             camp["no_code_change_count"] = camp.get("no_code_change_count", 0) + 1
@@ -1595,6 +1753,9 @@ def ensure_campaign_task(camp, state, cfg, now):
     camp["awaiting_result"] = True
     camp["awaiting_result_at"] = (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     camp["last_task_id"] = task["id"]
+    # 记录本轮开始时的 HEAD，供本轮结束后的独立验证判断是否真的提交了新改动
+    if camp.get("repo_path"):
+        camp["head_before"] = _git_head(camp["repo_path"])
     save_state(state)
     log(f"迭代活动 #{camp['id']} 已生成第 {camp['current_iteration'] + 1} 轮任务"
         f"（方向：{label}）模型={model or '自动(免费时段)'}")
@@ -1736,7 +1897,20 @@ def run_iteration_step(state, cfg, now=None):
             elif t.get("status") == "sent":
                 res = try_capture_campaign_result(camp, cfg)
                 if res is not None:
-                    advance_campaign(camp, res, state)
+                    # 独立验证闸门：监控器自己跑测试并检查 HEAD 是否前进，
+                    # 结论优先于模型自述；未通过则把失败日志回灌进下一轮提示。
+                    v_ok, v_reason, v_ev = _verify_repo_round(camp, cfg)
+                    camp["last_verify"] = v_ev
+                    camp["last_verify_ok"] = v_ok
+                    if v_ok:
+                        log(f"迭代活动 #{camp['id']} 独立验证通过：{v_reason[:120]}")
+                        advance_campaign(camp, res, state, verify_ok=True)
+                    else:
+                        log(f"迭代活动 #{camp['id']} 独立验证未通过：{v_reason[:200]}")
+                        advance_campaign(
+                            camp,
+                            res + "\n\n【独立验证未通过】\n" + v_reason,
+                            state, verify_ok=False)
                     # 成功推进后，若活动仍活跃，立即生成下一轮任务（同一轮内连续迭代）
                     if camp.get("status") == "running":
                         ensure_campaign_task(camp, state, cfg, now)
@@ -2704,6 +2878,14 @@ def monitor_tick(cfg: dict, now=None) -> dict:
     if balance_guard_paused(state):
         info["guard_paused"] = True
         return info
+    # 单决策者：夜间 runner 持锁时，GUI/其他监控只观察，不发送也不推进活动，
+    # 避免两个进程同时捕获同一回复、各自入队下一轮。
+    if _external_orchestrator_active():
+        info["observing"] = True
+        if time.time() - _LAST_OBSERVE_LOG["at"] > 600:
+            _LAST_OBSERVE_LOG["at"] = time.time()
+            log("检测到夜间 runner 持有决策者锁，本监控只观察，不发送/不迭代")
+        return info
     # ① 统一调度发送
     try:
         pending = pending_tasks(state)
@@ -2820,8 +3002,8 @@ def wait_for_cdp(timeout=300, poll=15) -> bool:
         time.sleep(max(0.0, float(poll)))
 
 
-def run_night_runner(cfg: dict, goal: str, max_rounds: int = 20,
-                     strategy: str = "autopilot") -> int:
+def _run_night_runner_body(cfg: dict, goal: str, max_rounds: int = 20,
+                           strategy: str = "autopilot") -> int:
     """夜间自动跑：创建/恢复 autopilot 迭代活动，免费窗口内持续推进。
 
     与 run_loop 的区别：
@@ -2848,12 +3030,28 @@ def run_night_runner(cfg: dict, goal: str, max_rounds: int = 20,
     state = load_state()
     camps = ensure_campaigns(state)
     running = [c for c in camps if c.get("status") == "running"]
+    # 夜间自迭代必须绑定仓库与验证命令，否则"成功"只能靠模型自述。
+    repo_default = (cfg.get("night_repo_path") or str(BASE_DIR)).strip()
+    test_default = (cfg.get("night_test_cmd") or "python test_core.py").strip()
     if not running:
         # 找同目标的暂停活动不自动恢复（暂停原因需人工确认），只新建
         camp = create_campaign(state, goal, strategy=strategy,
-                               model="", max_iterations=0)
-        log(f"夜间模式：已新建 autopilot 活动 #{camp['id']}")
+                               model="", max_iterations=0,
+                               repo_path=repo_default, test_cmd=test_default)
+        log(f"夜间模式：已新建 autopilot 活动 #{camp['id']}"
+            f"（仓库={repo_default} 验证={test_default}）")
     else:
+        # 复用旧活动时回填空的仓库/验证字段（不覆盖用户显式设置的值）
+        changed = False
+        for c in running:
+            if not c.get("repo_path"):
+                c["repo_path"] = repo_default
+                changed = True
+            if not c.get("test_cmd"):
+                c["test_cmd"] = test_default
+                changed = True
+        if changed:
+            save_state(state)
         log(f"夜间模式：复用 {len(running)} 个进行中的迭代活动")
     if goal and not (state.get("model_catalog") or []):
         # 首次跑目录为空时先做一次免费发现，避免第一轮就因目录过期暂停
@@ -2892,6 +3090,22 @@ def run_night_runner(cfg: dict, goal: str, max_rounds: int = 20,
             break
         time.sleep(interval)
     return rounds
+
+
+def run_night_runner(cfg: dict, goal: str, max_rounds: int = 20,
+                     strategy: str = "autopilot") -> int:
+    """夜间入口：先拿单实例决策者锁，再跑主体；退出时释放。
+
+    保证同一时刻只有一个进程推进迭代活动（GUI 只观察）。锁按 PID+存活判定，
+    进程崩溃留下的过期锁会被下一次启动自动接管。"""
+    token = acquire_orchestrator_lock()
+    if token is None:
+        log("夜间模式：已有活跃的决策者（另一个 runner 正在推进），本进程退出")
+        return 0
+    try:
+        return _run_night_runner_body(cfg, goal, max_rounds, strategy)
+    finally:
+        release_orchestrator_lock(token)
 
 
 def _count_new_rounds(state) -> int:

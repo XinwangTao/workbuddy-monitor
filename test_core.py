@@ -30,6 +30,7 @@ core.STATE_FILE = _TMP / "state.json"
 core.TASKS_ARCHIVE_FILE = _TMP / "state.tasks-archive.jsonl"
 core.CONFIG_FILE = _TMP / "config.json"
 core.LOG_FILE = _TMP / "monitor.log"
+core.ORCH_LOCK_FILE = _TMP / "night-orchestrator.lock"
 
 # ---------------------------------------------------------------- 安全隔离（硬性）
 # 测试绝不能触发真实剪贴板/键盘/窗口自动化。
@@ -2524,6 +2525,111 @@ core._get_clipboard_text = _orig_get41
 core.set_clipboard_text = _orig_set41
 core._find_window_by_title = _orig_find41
 core._activate_window = _orig_act41
+
+# ================================================================ 42. 单决策者锁
+print("\n=== 42. 夜间单决策者锁 ===")
+if core.ORCH_LOCK_FILE.exists():
+    core.ORCH_LOCK_FILE.unlink()
+_tok42 = core.acquire_orchestrator_lock()
+check("42a 首次拿锁成功", _tok42 is not None)
+check("42b 同进程可重入", core.acquire_orchestrator_lock() is not None)
+import os as _os42  # noqa: E402
+core.ORCH_LOCK_FILE.write_text(
+    json.dumps({"pid": _os42.getppid(), "started": _time.time()}), encoding="utf-8")
+check("42c 其他存活进程持锁→拿不到", core.acquire_orchestrator_lock() is None)
+check("42d 外部决策者被识别", core._external_orchestrator_active() is True)
+core.ORCH_LOCK_FILE.write_text(
+    json.dumps({"pid": 999999, "started": _time.time()}), encoding="utf-8")
+_tok42b = core.acquire_orchestrator_lock()
+check("42e 死进程/过期锁可接管", _tok42b is not None)
+check("42f 接管后不再算外部决策者", core._external_orchestrator_active() is False)
+core.release_orchestrator_lock(_tok42b)
+check("42g 释放后锁文件消失", not core.ORCH_LOCK_FILE.exists())
+
+# ================================================================ 43. 独立验证闸门
+print("\n=== 43. 独立验证闸门（测试退出码 + HEAD 前进）===")
+import subprocess as _sp43  # noqa: E402
+import tempfile as _tf43  # noqa: E402
+_repo43 = Path(_tf43.mkdtemp(prefix="wbverify_"))
+
+
+def _git43(*a):
+    return _sp43.run(["git", *a], cwd=_repo43, capture_output=True, text=True)
+
+
+_git43("init")
+_git43("config", "user.email", "t@t")
+_git43("config", "user.name", "t")
+(_repo43 / "a.py").write_text("x=1\n", encoding="utf-8")
+_git43("add", ".")
+_git43("commit", "-m", "init")
+_h43 = core._git_head(_repo43)
+_c43 = {"repo_path": str(_repo43), "test_cmd": "python -c \"print('ok')\"",
+        "head_before": _h43}
+_ok43, _why43, _ev43 = core._verify_repo_round(_c43, {})
+check("43a 测试通过但没有新 commit→无效",
+      _ok43 is False and _ev43.get("committed") is False, _why43)
+(_repo43 / "a.py").write_text("x=2\n", encoding="utf-8")
+_git43("add", ".")
+_git43("commit", "-m", "round2")
+_ok43b, _why43b, _ev43b = core._verify_repo_round(_c43, {})
+check("43b 测试通过且有新 commit→有效",
+      _ok43b is True and _ev43b.get("committed") is True, _why43b)
+_c43["head_before"] = core._git_head(_repo43)
+_c43["test_cmd"] = "python -c \"import sys; sys.exit(1)\""
+(_repo43 / "a.py").write_text("x=3\n", encoding="utf-8")
+_git43("add", ".")
+_git43("commit", "-m", "round3")
+_ok43c, _why43c, _ev43c = core._verify_repo_round(_c43, {})
+check("43c 测试失败→无效（即使有新 commit）",
+      _ok43c is False and _ev43c.get("exit_code") != 0, _why43c)
+
+fresh_state()
+_camp43 = core.create_campaign(core.load_state(), "验证计数", strategy="improve")
+core.advance_campaign(_camp43, "一切正常。", core.load_state(), verify_ok=False)
+_camp43 = core.campaign_by_id(core.load_state(), _camp43["id"])
+check("43d 验证失败→error_count+1（不受文案影响）",
+      _camp43.get("error_count") == 1, f"实际={_camp43.get('error_count')}")
+core.advance_campaign(_camp43, "一切正常。", core.load_state(), verify_ok=True)
+_camp43 = core.campaign_by_id(core.load_state(), _camp43["id"])
+check("43e 验证通过→error_count 归零", _camp43.get("error_count") == 0,
+      f"实际={_camp43.get('error_count')}")
+
+# 夜间活动默认绑定仓库与验证命令
+fresh_state()
+_orig_tick43 = core.monitor_tick
+_real_ifw43 = core.in_free_window
+_seq43 = {"n": 0}
+
+
+def _tick43(cfg, now=None):
+    return {"sent": 0, "blocked": 0, "iterated": True, "errors": []}
+
+
+def _ifw43(cfg, now=None, state=None):
+    _seq43["n"] += 1
+    return _seq43["n"] <= 2
+
+
+core.monitor_tick = _tick43
+core.in_free_window = _ifw43
+_orig_sleep43 = core.time.sleep
+core.time.sleep = lambda *a, **k: None
+_cfg43 = cfg_of()
+_cfg43["night_preflight"] = False
+try:
+    core.run_night_runner(_cfg43, "绑定测试目标", max_rounds=20)
+finally:
+    core.monitor_tick = _orig_tick43
+    core.in_free_window = _real_ifw43
+    core.time.sleep = _orig_sleep43
+_c43b = next((c for c in core.ensure_campaigns(core.load_state())
+              if c.get("goal") == "绑定测试目标"), None)
+check("43f 夜间活动默认绑定仓库与测试命令",
+      bool(_c43b) and _c43b.get("repo_path") == str(core.BASE_DIR)
+      and _c43b.get("test_cmd") == "python test_core.py",
+      f"实际={(_c43b or {}).get('repo_path')!r} / {(_c43b or {}).get('test_cmd')!r}")
+fresh_state()
 
 # ================================================================ 汇总
 print("\n" + "=" * 56)
