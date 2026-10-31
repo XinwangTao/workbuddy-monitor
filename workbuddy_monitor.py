@@ -65,6 +65,10 @@ DEFAULT_CONFIG = {
     # 总量超过 max_keep 时也从最旧的已结束任务开始归档。pending 永不清理。
     "task_retention_days": 7,
     "task_max_keep": 500,
+    # 夜间 runner 启动前置检查：等 WorkBuddy CDP 就绪后再开始，避免
+    # "拉不起 WorkBuddy → 免费目录过期 → 活动暂停 → 整夜空转"。
+    "night_preflight": True,
+    "night_preflight_timeout": 300,
     # Windows 通知标题
     "notify_title": "WorkBuddy 监控",
     # 到点自动发送到 WorkBuddy 窗口（复制到剪贴板 + 粘贴 + 回车）
@@ -2769,6 +2773,35 @@ def run_loop(cfg: dict, once: bool = False):
 # ---------------------------------------------------------------------------
 # 夜间无人值守：免费窗口内持续 autopilot 迭代，窗口结束自动收尾
 # ---------------------------------------------------------------------------
+def _cdp_ready() -> bool:
+    """WorkBuddy CDP 是否可用；离线桩/旧版本没有该能力时不阻塞。"""
+    try:
+        import workbuddy_cdp
+        fn = getattr(workbuddy_cdp, "is_workbuddy_running", None)
+        if fn is None:
+            return True
+        return bool(fn())
+    except Exception:
+        return True
+
+
+def wait_for_cdp(timeout=300, poll=15) -> bool:
+    """夜间启动前置检查：等 CDP 就绪。返回 True=就绪，False=超时。
+
+    夜间最典型的空转原因不是模型，而是 WorkBuddy 没带 CDP 起来：
+    免费目录发现失败 → 新活动一创建就被 fail-closed 暂停 → runner 退出。
+    与其静默空转，不如在开跑前明确等一等，并把失败原因写清楚。"""
+    deadline = time.time() + max(0.0, float(timeout))
+    while True:
+        if _cdp_ready():
+            log("夜间前置检查：WorkBuddy CDP 已就绪")
+            return True
+        if time.time() >= deadline:
+            return False
+        log(f"夜间前置检查：WorkBuddy CDP 未就绪，{poll}s 后重试")
+        time.sleep(max(0.0, float(poll)))
+
+
 def run_night_runner(cfg: dict, goal: str, max_rounds: int = 20,
                      strategy: str = "autopilot") -> int:
     """夜间自动跑：创建/恢复 autopilot 迭代活动，免费窗口内持续推进。
@@ -2782,6 +2815,18 @@ def run_night_runner(cfg: dict, goal: str, max_rounds: int = 20,
     安全底线不变：任何一轮无法确认免费通道（免费模型消失/目录过期/余额
     异常），活动会被 run_iteration_step 自动暂停，night runner 检测到无
     活跃活动后退出，绝不改走积分通道。"""
+    if cfg.get("night_preflight", True):
+        timeout = float(cfg.get("night_preflight_timeout", 300))
+        if not wait_for_cdp(timeout=timeout, poll=15):
+            msg = ("夜间前置检查失败：WorkBuddy/CDP 未就绪，本次不启动迭代"
+                   "（避免整夜因免费目录过期空转）。请确认 WorkBuddy 已登录，"
+                   "可运行 start_workbuddy.ps1 -RestartForCdp 后重试。")
+            log(msg)
+            try:
+                send_windows_notification(cfg.get("notify_title", "WorkBuddy 监控"), msg)
+            except Exception:
+                pass
+            return 0
     state = load_state()
     camps = ensure_campaigns(state)
     running = [c for c in camps if c.get("status") == "running"]

@@ -1868,6 +1868,7 @@ core.save_state(_st)
 # 窗口设为全天，fake tick 不推进轮数 → 依赖 max_rounds 逻辑不触发；
 # 用 in_free_window 的真实判断：free_window 全天开放
 cfg_night = cfg_of(free_window={"enabled": True, "start": "00:00", "end": "23:59"})
+cfg_night["night_preflight"] = False  # 本节只验证 runner 循环，前置检查单独在 40 节测
 # in_free_window 读 state 里的 free_info/发现，需要模型免费 + 目录新鲜（已 stamp）
 # 让 runner 第二轮就"窗口外"：直接 patch in_free_window
 _real_ifw = core.in_free_window
@@ -2457,6 +2458,35 @@ check("39e 失败分支清掉了半截残稿（重试不会拼接）",
       f"清稿调用={_part['clears']!r} 残留={_part['text']!r}")
 if _orig_mod39 is not None:
     sys.modules["workbuddy_cdp"] = _orig_mod39
+fresh_state()
+
+# ================================================================ 40. 夜间前置检查
+print("\n=== 40. 夜间前置检查：CDP 未就绪不空转 ===")
+_orig_ready40 = core._cdp_ready
+_seq40 = {"n": 0}
+
+
+def _ready_seq40():
+    _seq40["n"] += 1
+    return _seq40["n"] >= 3
+
+
+core._cdp_ready = _ready_seq40
+check("40a 等到 CDP 就绪（第 3 次检查成功）",
+      core.wait_for_cdp(timeout=1, poll=0.01) is True and _seq40["n"] == 3,
+      f"检查次数={_seq40['n']}")
+core._cdp_ready = lambda: False
+check("40b 超时返回 False", core.wait_for_cdp(timeout=0.05, poll=0.01) is False)
+fresh_state()
+_cfg40 = cfg_of()
+_cfg40["night_preflight"] = True
+_cfg40["night_preflight_timeout"] = 0
+_n40 = core.run_night_runner(_cfg40, "前置失败目标", max_rounds=1)
+check("40c 前置失败→返回 0 且不创建活动",
+      _n40 == 0 and not any(c.get("goal") == "前置失败目标"
+                            for c in core.ensure_campaigns(core.load_state())),
+      f"rounds={_n40}")
+core._cdp_ready = _orig_ready40
 fresh_state()
 
 # ================================================================ 汇总
