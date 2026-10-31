@@ -2346,6 +2346,20 @@ _n37b = core.prune_old_tasks(core.load_state(),
 _ids37b = sorted(t["id"] for t in core.load_state()["tasks"])
 check("37e 超过 max_keep→从最旧开始归档，只留最新 N 条",
       _n37b == 3 and _ids37b == [13, 14], f"归档数={_n37b} 保留={_ids37b}")
+
+# 37f/37g：清理时间戳必须在锁内落盘，不能返回后拿旧视图整表写回
+fresh_state()
+core.add_task(core.load_state(), "并发前的任务", model="")
+_old37 = core.load_state()                      # 模拟调用方持有的旧快照
+core.add_task(core.load_state(), "另一个进程新增的任务", model="")
+core.prune_old_tasks(_old37, {"task_retention_days": 7, "task_max_keep": 500},
+                     mark_date="2026-10-31")
+_after37 = core.load_state()
+_txt37 = " ".join(t.get("content", "") for t in _after37.get("tasks", []))
+check("37f 清理不会覆盖并发新增的任务", "另一个进程新增的任务" in _txt37,
+      f"实际任务={_txt37}")
+check("37g 清理时间戳在锁内落盘", _after37.get("tasks_pruned_date") == "2026-10-31",
+      f"实际={_after37.get('tasks_pruned_date')!r}")
 fresh_state()
 if core.TASKS_ARCHIVE_FILE.exists():
     core.TASKS_ARCHIVE_FILE.unlink()

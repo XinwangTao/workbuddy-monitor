@@ -975,13 +975,17 @@ def _task_created_dt(t):
         return None
 
 
-def prune_old_tasks(state, cfg=None, now=None):
+def prune_old_tasks(state, cfg=None, now=None, mark_date=None):
     """把已结束的旧任务移到归档 JSONL，返回归档条数。
 
     背景：state.json 长期运行会累积数百条 failed/sent 任务（实测 423 条/778KB），
     每次读盘、写盘、GUI 刷新都要为历史失败买单。
     安全边界：pending 永不归档；被任何活动 last_task_id 引用的任务永不归档；
     只追加到独立归档文件，不改写/删除原始记录；写归档失败则整体放弃本次清理。
+
+    mark_date: 写入 state["tasks_pruned_date"]（如 "2026-10-31"）。必须在
+    本函数的同一把锁内落盘——调用方若在返回后再 save_state(旧内存视图)，
+    会覆盖掉其他进程在两步之间新增的任务（整表写回的丢更新）。
     """
     cfg = cfg or {}
     now = now or datetime.now()
@@ -1024,6 +1028,13 @@ def prune_old_tasks(state, cfg=None, now=None):
             archive.extend(t for t in kept if id(t) in drop)
             kept = [t for t in kept if id(t) not in drop]
         if not archive:
+            # 即使没有可归档任务，也把"今天已清理过"的时间戳在同一把锁内写好，
+            # 避免调用方为了打标记再整表写回一次。
+            if mark_date and fresh.get("tasks_pruned_date") != mark_date:
+                fresh["tasks_pruned_date"] = mark_date
+                save_state(fresh)
+                if state is not None:
+                    state["tasks_pruned_date"] = mark_date
             return 0
         try:
             TASKS_ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1034,9 +1045,13 @@ def prune_old_tasks(state, cfg=None, now=None):
             log(f"任务归档失败，取消本次清理（state 未改动）: {e}")
             return 0
         fresh["tasks"] = kept
+        if mark_date:
+            fresh["tasks_pruned_date"] = mark_date
         save_state(fresh)
         if state is not None:
             state["tasks"] = kept
+            if mark_date:
+                state["tasks_pruned_date"] = mark_date
         log(f"任务表清理：归档 {len(archive)} 条已结束任务 → "
             f"{TASKS_ARCHIVE_FILE.name}，保留 {len(kept)} 条")
         return len(archive)
@@ -2617,10 +2632,10 @@ def monitor_tick(cfg: dict, now=None) -> dict:
     today = now.strftime("%Y-%m-%d")
     if state.get("tasks_pruned_date") != today:
         try:
-            prune_old_tasks(state, cfg, now)
+            # mark_date 交给 prune 在锁内落盘；不要返回后拿旧内存视图整表写回，
+            # 否则会覆盖掉其他进程在这一瞬间新增的任务。
+            prune_old_tasks(state, cfg, now, mark_date=today)
             state = load_state()
-            state["tasks_pruned_date"] = today
-            save_state(state)
         except Exception as e:
             info["errors"].append(f"prune_tasks: {e}")
             log(f"任务表清理异常(已跳过): {e}")
