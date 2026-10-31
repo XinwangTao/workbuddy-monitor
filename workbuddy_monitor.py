@@ -2157,7 +2157,10 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
     # 真实投递校验：消息必须真的出现在对话里，否则只是“假成功”
     # （粘贴/提交可能静默失败，仅看输入框清空会误判为已发送）。
     if not _sent_message_present_in_conversation(content):
-        return False, "回车后消息未出现在对话中（疑似未真正提交），已保留任务待重试"
+        # 任何发送后校验失败都要清残留：否则下一轮重试会把新内容追加到
+        # 半截旧稿后面，发出「旧稿+新内容」拼成的那条。
+        _clear_editor_leftover(content)
+        return False, "回车后消息未出现在对话中（疑似未真正提交），已清空残留草稿并保留任务待重试"
     return True, "已自动粘贴并发送到 WorkBuddy"
 
 
@@ -2230,6 +2233,22 @@ def _editor_still_has_text(needle: str) -> bool:
         return False
 
 
+def _editor_text_is_ours(txt: str, content: str) -> bool:
+    """输入框里残留的文本是否来自本轮待发内容（而非用户自己的草稿）。
+
+    只做保守判定：残稿是本轮内容的片段，或内容完整嵌在输入框里（旧稿+新内容），
+    或至少 12 字前缀重合。判定不成立就绝不动输入框。"""
+    t = _norm_ws(txt)
+    c = _norm_ws(content)
+    if not t or not c:
+        return False
+    if t in c:
+        return len(t) >= 4          # 残稿是本轮内容的一部分
+    if c in t:
+        return True                 # 输入框里混着旧稿 + 本轮内容
+    return len(t) >= 12 and (t[:12] in c or c[:12] in t)
+
+
 def _clear_editor_leftover(needle: str) -> bool:
     """清掉回车没提交、残留在输入框里的我方草稿。
 
@@ -2239,7 +2258,23 @@ def _clear_editor_leftover(needle: str) -> bool:
         import workbuddy_cdp
         if not workbuddy_cdp.is_workbuddy_running():
             return False
-        return bool(workbuddy_cdp.clear_editor((needle or "").strip()[:40]))
+        n = (needle or "").strip()
+        # 完整草稿仍在：沿用原逻辑，传特征字，绝不误删别的稿
+        contains = getattr(workbuddy_cdp, "editor_contains", None)
+        if n and contains is not None and contains(n[:40]):
+            return bool(workbuddy_cdp.clear_editor(n[:40]))
+        # 草稿不完整（回车吞掉了一部分 / 注入落了一半）：
+        # 先读输入框，只有确认是本轮内容同源才强制清空。
+        get_text = getattr(workbuddy_cdp, "editor_text", None)
+        if get_text is not None:
+            txt = (get_text() or "").strip()
+            if not txt:
+                return True
+            if _editor_text_is_ours(txt, n):
+                return bool(workbuddy_cdp.clear_editor(""))
+            return False
+        # 桩/旧版本没有 editor_text：保持原行为
+        return bool(workbuddy_cdp.clear_editor(n[:40]))
     except Exception:
         return False
 

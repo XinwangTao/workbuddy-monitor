@@ -44,6 +44,7 @@ core._find_window_by_title = lambda substr: core.user32.GetForegroundWindow()
 core._activate_window = lambda hwnd: True
 core._ctrl_v = lambda: None
 core._enter = lambda: None
+core.send_windows_notification = lambda *a, **k: None  # 不弹真实系统通知
 
 # ---------------------------------------------------------------- 伪造 CDP
 FAKE = {
@@ -2382,6 +2383,81 @@ check("38f 进程不是 WorkBuddy→拒绝",
       _wi("WorkBuddy", "Chrome_WidgetWin_1", "chrome.exe") is False)
 check("38g 取不到进程名时退回前缀规则放行",
       _wi("WorkBuddy", "SomeClass", "") is True)
+
+# ================================================================ 39. 部分残留草稿必须清掉
+print("\n=== 39. 消息未进对话时，半截残留草稿也要清掉 ===")
+_part = {"text": "", "clears": []}
+
+
+def _p_clear(needle=""):
+    _part["clears"].append(needle)
+    _part["text"] = ""
+    return True
+
+
+class _PartCDP:
+    is_workbuddy_running = staticmethod(lambda: True)
+    editor_contains = staticmethod(lambda n: False)   # 完整内容已不在框里
+    editor_text = staticmethod(lambda limit=2000: _part["text"])
+    clear_editor = staticmethod(_p_clear)
+
+
+_orig_mod39 = sys.modules.get("workbuddy_cdp")
+sys.modules["workbuddy_cdp"] = _PartCDP
+_content39 = "回车后消息未出现在对话中的部分残留内容"
+_part["text"] = "回车后消息未出现在对话中"          # 半截残稿（本轮内容前缀）
+_part["clears"] = []
+check("39a 半截残稿被识别为我方草稿并强制清空",
+      core._clear_editor_leftover(_content39) is True and _part["clears"] == [""],
+      f"清稿调用={_part['clears']!r} 残留={_part['text']!r}")
+_part["text"] = "我自己手写的草稿，不要动"
+_part["clears"] = []
+check("39b 非我方草稿绝不清（不误删用户输入）",
+      core._clear_editor_leftover(_content39) is False and _part["clears"] == [],
+      f"清稿调用={_part['clears']!r}")
+
+
+class _NoTextCDP:
+    is_workbuddy_running = staticmethod(lambda: True)
+    editor_contains = staticmethod(lambda n: False)
+    clear_editor = staticmethod(_p_clear)
+
+
+sys.modules["workbuddy_cdp"] = _NoTextCDP
+_part["clears"] = []
+check("39c 无 editor_text 的旧桩退回原行为（传特征字）",
+      core._clear_editor_leftover(_content39) is True
+      and _part["clears"] == [_content39[:40]], f"清稿调用={_part['clears']!r}")
+
+# 端到端：消息未进对话 + 半截残稿 → 发送失败分支必须清稿
+class _PartSendCDP(_PartCDP):
+    start_new_conversation = staticmethod(lambda: True)
+    focus_editor = staticmethod(lambda: True)
+    select_model = staticmethod(lambda *a, **k: (True, ""))
+    insert_text_into_editor = staticmethod(lambda c: True)
+    _in_conversation_page = staticmethod(lambda: True)
+    read_conversation = staticmethod(lambda: [])
+    _open_conversation_by_title = staticmethod(lambda kw: False)
+
+
+sys.modules["workbuddy_cdp"] = _PartSendCDP
+_st39 = fresh_state()
+_st39["model_catalog"] = [{"name": "FreeA", "free": True, "multiplier": 0.0}]
+stamp(_st39)
+core.save_state(_st39)
+_part["text"] = "回车后消息未出现在对话中"
+_part["clears"] = []
+_t39 = {"id": 3901, "content": _content39, "model": "FreeA",
+        "allow_credit": False, "status": "pending", "attempts": 0}
+core.send_task(_t39, cfg_send)
+check("39d 消息不在对话→任务不标 sent", _t39.get("status") != "sent",
+      f"实际={_t39.get('status')}")
+check("39e 失败分支清掉了半截残稿（重试不会拼接）",
+      _part["clears"] == [""] and _part["text"] == "",
+      f"清稿调用={_part['clears']!r} 残留={_part['text']!r}")
+if _orig_mod39 is not None:
+    sys.modules["workbuddy_cdp"] = _orig_mod39
+fresh_state()
 
 # ================================================================ 汇总
 print("\n" + "=" * 56)

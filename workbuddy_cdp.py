@@ -829,6 +829,27 @@ def select_model(name):
     return False, f"未找到模型 {name!r}"
 
 
+def editor_text(limit: int = 2000) -> str:
+    """读取当前可见输入框的文本（用于识别部分残留草稿）。"""
+    js = r"""
+    (() => {
+      const eds = [...document.querySelectorAll(
+          '[contenteditable="true"], textarea, .cr-editor, [class*="editable"]')];
+      const vis = eds.filter(e => {
+        const r = e.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      const el = vis[vis.length - 1] || eds[eds.length - 1];
+      if (!el) return null;
+      return ((el.innerText || el.value || '') + '').slice(0, %d);
+    })()
+    """ % int(limit)
+    try:
+        return _evaluate(js, timeout=10) or ""
+    except Exception:
+        return ""
+
+
 def editor_contains(needle: str) -> bool:
     """WorkBuddy 输入框当前文本是否包含 needle。
 
