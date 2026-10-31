@@ -2134,6 +2134,148 @@ finally:
     core.set_balance_guard_paused(None, False, "test cleanup")
     fresh_state()
 
+# ================================================================ 35. 夜间迭代卡死根因加固
+print("\n=== 35. 夜间迭代：完整回复捕获 / [[NEXT]] 宽限 / 跨进程发送认领 ===")
+# —— 35a. 一轮回复被拆成多个助手条目时，必须拼接全部，而不是只取第一条 ——
+real_cdp.read_conversation = lambda: [
+    {"role": "user", "text": "本轮迭代提示词：只回复固定文本"},
+    {"role": "assistant", "text": "第一步：先读 SOP.md"},
+    {"role": "assistant", "text": "最终答复：已修复。\n[[NEXT]]补齐边界测试[[/NEXT]]"},
+]
+_turn = real_cdp._read_last_agent_reply("本轮迭代提示词：只回复固定文本")
+check("35a 一轮多助手条目→拼接全部（末尾 [[NEXT]] 不丢）",
+      _turn == "第一步：先读 SOP.md\n\n最终答复：已修复。\n[[NEXT]]补齐边界测试[[/NEXT]]",
+      f"实际={_turn!r}")
+check("35a2 读取 JS 用 data-assistant-content 收集全部正文块",
+      "[data-assistant-content]" in real_cdp._JS_READ_CONVERSATION)
+check("35a3 生成检测识别 processing 状态类",
+      "processing-status" in (real_cdp._agent_still_generating.__doc__ or ""))
+check("35a4 截断保留尾部（[[NEXT]] 在末尾）",
+      "slice(-CAP)" in real_cdp._JS_READ_CONVERSATION)
+
+# —— 35b. 即使状态行误判，也要求文本稳定两次才返回（防流式半截） ——
+_seq_reads = ["第一段思考中", "第一段思考中，最终答复。", "第一段思考中，最终答复。"]
+_read_i = {"n": 0}
+_orig_read_last = real_cdp._read_last_agent_reply
+_orig_gen2 = real_cdp._agent_still_generating
+
+
+def _fake_read_seq(prompt_hint=""):
+    i = min(_read_i["n"], len(_seq_reads) - 1)
+    _read_i["n"] += 1
+    return _seq_reads[i]
+
+
+real_cdp._read_last_agent_reply = _fake_read_seq
+real_cdp._agent_still_generating = lambda: False
+_orig_ensure = real_cdp._ensure_conversation_open
+real_cdp._ensure_conversation_open = lambda hint="": True  # 本节只验证稳定性，跳过会话定位
+_got_stable = real_cdp.last_assistant_message(timeout=3, poll=0.05,
+                                              prompt_hint="本轮迭代提示词：只回复固定文本")
+check("35b 文本未稳定前不返回，稳定后才返回最终版",
+      _got_stable == "第一段思考中，最终答复。" and _read_i["n"] >= 3,
+      f"实际={_got_stable!r} 读取次数={_read_i['n']}")
+real_cdp._ensure_conversation_open = _orig_ensure
+real_cdp._read_last_agent_reply = _orig_read_last
+real_cdp._agent_still_generating = _orig_gen2
+real_cdp.read_conversation = _real_read
+
+# —— 35c. autopilot：无 [[NEXT]] 且本轮还新 → 先不推进；超过宽限期才接受 ——
+_orig_cdp_mod = sys.modules.get("workbuddy_cdp")
+_marker_cdp = types.ModuleType("workbuddy_cdp")
+
+
+class _MarkerReply:
+    @staticmethod
+    def last_assistant_message(timeout=240, poll=15, prompt_hint=""):
+        return "本轮已改代码并跑通测试，但还没写标记。"
+
+
+_marker_cdp.last_assistant_message = _MarkerReply.last_assistant_message
+_marker_cdp.read_conversation = lambda: []
+sys.modules["workbuddy_cdp"] = _marker_cdp
+_reply_no_marker = "本轮已改代码并跑通测试，但还没写标记。"
+_camp_marker = {
+    "id": 3501, "strategy": "autopilot", "last_prompt": "本轮提示词",
+    "awaiting_result_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+}
+check("35c 新轮次无 [[NEXT]]→暂不推进（等最终答复）",
+      core.try_capture_campaign_result(_camp_marker, cfg2, timeout=1, poll=1) is None)
+_camp_marker["awaiting_result_at"] = (
+    datetime.now() - timedelta(seconds=core.AUTOPILOT_MARKER_GRACE + 5)
+).strftime("%Y-%m-%d %H:%M:%S")
+check("35c2 超过宽限期仍无 [[NEXT]]→按漏写推进",
+      core.try_capture_campaign_result(_camp_marker, cfg2, timeout=1, poll=1) == _reply_no_marker)
+_camp_marker["awaiting_result_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+_marker_cdp.last_assistant_message = lambda *a, **k: "已完成。[[NEXT]]补齐 parse 的边界测试[[/NEXT]]"
+check("35c3 带 [[NEXT]]→立即推进",
+      core.try_capture_campaign_result(_camp_marker, cfg2, timeout=1, poll=1)
+      == "已完成。[[NEXT]]补齐 parse 的边界测试[[/NEXT]]")
+if _orig_cdp_mod is not None:
+    sys.modules["workbuddy_cdp"] = _orig_cdp_mod
+
+# —— 35d. 跨进程发送认领：同一条 pending 任务只能被发送一次 ——
+fresh_state()
+_t_claim = core.add_task(core.load_state(), "认领测试内容", model="")
+check("35d 首次认领成功", core._claim_task_for_send(_t_claim["id"]) is True)
+check("35d2 同一任务重复认领失败（防 GUI/runner 双发）",
+      core._claim_task_for_send(_t_claim["id"]) is False)
+core.update_task(_t_claim["id"], status="sent")
+check("35d3 已 sent 的任务不再认领", core._claim_task_for_send(_t_claim["id"]) is False)
+_t_ttl = core.add_task(core.load_state(), "认领过期测试", model="")
+_st_ttl = core.load_state()
+for _t in _st_ttl["tasks"]:
+    if _t["id"] == _t_ttl["id"]:
+        _t["claimed_at"] = _time.time() - (core.TASK_CLAIM_TTL + 5)
+core.save_state(_st_ttl)
+check("35d4 认领超时可被接管（进程崩溃不永久卡任务）",
+      core._claim_task_for_send(_t_ttl["id"]) is True)
+fresh_state()  # 收尾
+
+# —— 35e. 人工恢复必须重置触发暂停的计数，否则恢复后下一轮立刻二次暂停 ——
+_c35 = core.create_campaign(core.load_state(), "恢复计数测试", strategy="autopilot")
+_st35 = core.load_state()
+for _c in _st35["campaigns"]:
+    if _c["id"] == _c35["id"]:
+        _c["status"] = "paused"
+        _c["pause_reason"] = "连续 3 轮未给出下一步方向"
+        _c["next_step_missing"] = 3
+        _c["error_count"] = 3
+        _c["no_code_change_count"] = 2
+core.save_state(_st35)
+core.set_campaign_status(core.load_state(), _c35["id"], "running")
+_c35r = core.campaign_by_id(core.load_state(), _c35["id"])
+check("35e 恢复后连续计数清零（不会一上来就 4>=3 二次暂停）",
+      _c35r.get("status") == "running" and _c35r.get("next_step_missing") == 0
+      and _c35r.get("error_count") == 0 and _c35r.get("no_code_change_count") == 0,
+      f"实际={_c35r}")
+fresh_state()  # 收尾
+
+# ================================================================ 36. 重复提示词必须定位到最近一轮
+print("\n=== 36. 重复提示词：定位最近一轮而非首轮旧回复 ===")
+_real_read36 = real_cdp.read_conversation
+real_cdp.read_conversation = lambda: [
+    {"role": "user", "text": "补一处可复现的真实缺陷并钉住它"},
+    {"role": "assistant", "text": "第一轮旧回复，已提交。"},
+    {"role": "user", "text": "补一处可复现的真实缺陷并钉住它"},
+    {"role": "assistant", "text": "第二轮新回复，[[NEXT]]继续[[/NEXT]]"},
+]
+_dup = real_cdp._read_last_agent_reply("补一处可复现的真实缺陷并钉住它")
+check("36a 同一提示词出现两次→取最近一轮回复（不因 conv.index 命中首轮）",
+      _dup == "第二轮新回复，[[NEXT]]继续[[/NEXT]]", f"实际={_dup!r}")
+real_cdp.read_conversation = lambda: [
+    {"role": "user", "text": "同一个提示词"},
+    {"role": "assistant", "text": "第一轮"},
+    {"role": "user", "text": "中间夹一轮别的任务"},
+    {"role": "assistant", "text": "别的回复"},
+    {"role": "user", "text": "同一个提示词"},
+    {"role": "assistant", "text": "第三轮"},
+]
+_dup2 = real_cdp._read_last_agent_reply("同一个提示词")
+check("36b 重复提示词跨多轮→仍取最后一次出现的回复",
+      _dup2 == "第三轮", f"实际={_dup2!r}")
+real_cdp.read_conversation = _real_read36
+
 # ================================================================ 汇总
 print("\n" + "=" * 56)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")

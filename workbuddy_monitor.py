@@ -25,6 +25,7 @@ if _sys.stdout and hasattr(_sys.stdout, 'reconfigure'):
     _sys.stdout.reconfigure(encoding='utf-8')
     _sys.stderr.reconfigure(encoding='utf-8')
 import json
+import os
 import re
 import subprocess
 import time
@@ -957,6 +958,38 @@ def pending_tasks(state: dict, model: str = ""):
     return [t for t in state.get("tasks", [])
             if t.get("status") == "pending" and (not model or t.get("model") == model)]
 
+
+TASK_CLAIM_TTL = 120  # 秒：发送认领的过期时间（防进程崩溃后任务永久卡住）
+
+
+def _claim_task_for_send(task_id, ttl: int = TASK_CLAIM_TTL) -> bool:
+    """跨进程原子认领待发任务，避免 GUI 监控与夜间 runner 同时发送同一条。
+
+    真实事故（2026-10-31 00:00 前后）：两个监控进程都在"磁盘仍是 pending"
+    检查通过后调用 send_task，同一条任务被连续发送两次（monitor.log 23:59:16/17），
+    触发 WorkBuddy 会话中断（回复里出现"用户已取消"），本轮 [[NEXT]] 丢失。
+
+    任务不在磁盘（CLI/测试直调）时不拦截；已 sent/failed 或他人刚认领则返回 False。
+    """
+    now = time.time()
+    with state_lock():
+        fresh = load_state()
+        t = next((x for x in fresh.get("tasks", []) if x.get("id") == task_id), None)
+        if t is None:
+            return True
+        if t.get("status") != "pending":
+            return False
+        try:
+            claimed_at = float(t.get("claimed_at") or 0)
+        except (TypeError, ValueError):
+            claimed_at = 0.0
+        if claimed_at and now - claimed_at < ttl:
+            return False
+        t["claimed_at"] = now
+        t["claimed_by"] = f"{os.getpid()}:{threading.get_ident()}"
+        save_state(fresh)
+        return True
+
 # ---------------------------------------------------------------------------
 # 自动迭代引擎
 # ---------------------------------------------------------------------------
@@ -1149,11 +1182,16 @@ def set_campaign_status(state, cid, status):
     if c:
         c["status"] = status
         if status == "running":
-            # 恢复时清空在途状态与暂停原因，下一轮重新生成任务
+            # 恢复时清空在途状态与暂停原因，下一轮重新生成任务；
+            # 同时重置触发自动暂停的连续计数——否则人工确认并修复后恢复，
+            # 下一轮再漏一次标记就会立刻（4>=3）再次暂停，恢复等于没恢复。
             c["awaiting_result"] = False
             c["last_task_id"] = None
             c["pause_reason"] = ""
             c["paused_at"] = ""
+            c["next_step_missing"] = 0
+            c["error_count"] = 0
+            c["no_code_change_count"] = 0
         save_state(state)
         log(f"迭代活动 #{cid} 状态 -> {status}")
         return True
@@ -1488,6 +1526,44 @@ def _gate_reply(camp, msg) -> bool:
     return False
 
 
+def _await_age_secs(camp):
+    """本轮任务已等待多少秒；无时间戳/解析失败返回 None。"""
+    ts = camp.get("awaiting_result_at")
+    if not ts:
+        return None
+    try:
+        dt = _parse_dt(ts)
+    except Exception:
+        return None
+    if dt is None:
+        return None
+    return max(0.0, (datetime.now() - dt).total_seconds())
+
+
+# autopilot 的 [[NEXT]] 在完整回复的最末尾。DOM 若仍处于流式/思考态，
+# 早读只会拿到前半段（实测丢 [[NEXT]] 后连判 3 轮 no-marker 直接暂停）。
+# 因此对"没有标记"的回复给一个宽限期：只要本轮还很新，就继续等最终答复；
+# 超过宽限期仍未出现标记，才按"模型确实没写"计入 next_step_missing。
+AUTOPILOT_MARKER_GRACE = 300
+
+
+def _capture_acceptable(camp, msg) -> bool:
+    """捕获到的文本能否作为本轮产出推进。"""
+    if not _gate_reply(camp, msg):
+        return False
+    if camp.get("strategy") == "autopilot":
+        step, why = extract_next_step(msg)
+        if step:
+            return True
+        age = _await_age_secs(camp)
+        if age is not None and age < AUTOPILOT_MARKER_GRACE:
+            log(f"迭代活动 #{camp.get('id')} 回复尚无 [[NEXT]]（已等待 {int(age)}s/"
+                f"{AUTOPILOT_MARKER_GRACE}s，判定可能仍在流式输出），本轮暂不推进")
+            return False
+        log(f"迭代活动 #{camp.get('id')} 已超过标记宽限期仍无 [[NEXT]]（{why}），按漏写推进")
+    return True
+
+
 def try_capture_campaign_result(camp, cfg, timeout=240, poll=15):
     """尝试读取 WorkBuddy 对 camp.last_task_id 的回复。返回文本或 None（未就绪/超时/不可用）。
 
@@ -1502,7 +1578,7 @@ def try_capture_campaign_result(camp, cfg, timeout=240, poll=15):
         import workbuddy_cdp
         msg = workbuddy_cdp.last_assistant_message(
             timeout=timeout, poll=poll, prompt_hint=hint)
-        if msg and _gate_reply(camp, msg):
+        if msg and _capture_acceptable(camp, msg):
             return msg
         # 主 hint（last_prompt）定位不到会话时的兜底：改用本轮任务原文作 hint。
         # 场景：活动是恢复的/last_prompt 被覆盖，但用户气泡内容=任务原文，
@@ -1512,13 +1588,13 @@ def try_capture_campaign_result(camp, cfg, timeout=240, poll=15):
             log("迭代回复捕获：last_prompt 未命中，改用任务原文定位会话重试")
             msg = workbuddy_cdp.last_assistant_message(
                 timeout=min(timeout, 60), poll=poll, prompt_hint=task_hint)
-            if msg and _gate_reply(camp, msg):
+            if msg and _capture_acceptable(camp, msg):
                 return msg
     except Exception as e:
         log(f"迭代读取 WorkBuddy 回复失败(CDP, 尝试回退源): {e}")
     # 回退源：回复缓存文件
     cached = _read_reply_cache_file(camp, cfg)
-    if cached and _gate_reply(camp, cached):
+    if cached and _capture_acceptable(camp, cached):
         log("迭代回复改由缓存文件捕获（CDP DOM 不可用）")
         return cached
     return None
@@ -1845,8 +1921,11 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
         import workbuddy_cdp
         if workbuddy_cdp.is_workbuddy_running():
             try:
-                if reuse_conversation or workbuddy_cdp.start_new_conversation():
-                    log("复用迭代会话" if reuse_conversation else "已回新建任务页，消息不会污染历史会话")
+                if reuse_conversation:
+                    log("复用迭代会话")
+                elif workbuddy_cdp.start_new_conversation():
+                    log("已回新建任务页，消息不会污染历史会话")
+                else:
                     log("警告：未能确认新建任务页（可能无 CDP 或按钮未命中），继续发送")
             except Exception as e2:
                 log(f"新建会话步骤异常（忽略）: {e2}")
@@ -2000,6 +2079,12 @@ def _clear_editor_leftover(needle: str) -> bool:
 def send_task(task: dict, cfg: dict):
     mode = cfg.get("send_mode", "notify")
     state = load_state()  # 发送前取最新状态（含 model_catalog / free_info）
+    # 跨进程认领（GUI 监控 + 夜间 runner 共用同一份 state.json）：
+    # 没有原子认领时两个进程都会通过"磁盘仍是 pending"检查并各发一次，
+    # 实测会把同一提示词重复注入同一会话，WorkBuddy 报"用户已取消"、本轮产出丢失。
+    if not _claim_task_for_send(task.get("id")):
+        log(f"任务 #{task.get('id')} 已被其他监控进程认领或已发送，跳过本轮")
+        return
     # 这两个变量在函数末尾的余额守卫中无条件引用，必须在此初始化，
     # 否则 command / api 模式会因未定义而抛 NameError，导致任务状态永远标不上 sent。
     auto = cfg.get("auto_send", {})

@@ -403,20 +403,35 @@ _JS_READ_CONVERSATION = r"""
     const agent  = it.querySelector('.cr-agent');
     let body = null;
     if (agent) {
-      // 只取正文容器：.cr-agent__content（内含 .cr-markdown），
-      // 过滤深度思考折叠块与 footer 元数据（模型名 / 时间 / 共消耗）
-      const c = agent.querySelector('.cr-agent__content')
-             || agent.querySelector('.cr-markdown')
-             || agent.querySelector('.cr-chat-message--assistant')
-             || agent.querySelector('[data-role="assistant"]');
-      if (c) body = pickText(c);
+      // 关键：WorkBuddy 5.6.2 会把一轮回复拆成多个 .cr-agent 分组渲染
+      // （思考组 / 工具组 / 最终正文组）。只取第一个 .cr-agent__content 会把
+      // 中间态思考文本当成"本轮回复"，末尾的 [[NEXT]] 永远读不到——
+      // 实测 2026-10-31 夜间连续 3 轮因此被判 no-marker 并自动暂停。
+      // 因此按 DOM 顺序拼接本条消息内所有带 data-assistant-content 的正文容器。
+      const blocks = [...it.querySelectorAll('[data-assistant-content]')];
+      if (blocks.length) {
+        body = blocks.map(pickText).filter(Boolean).join('\n\n').trim();
+      } else {
+        // 旧版本/结构变化兜底：只从 .cr-agent__content 取正文，
+        // 过滤深度思考折叠块与 footer 元数据（模型名 / 时间 / 共消耗）
+        const c = agent.querySelector('.cr-agent__content')
+               || agent.querySelector('.cr-markdown')
+               || agent.querySelector('.cr-chat-message--assistant')
+               || agent.querySelector('[data-role="assistant"]');
+        if (c) body = pickText(c);
+      }
     } else if (isUser) {
       const c = it.querySelector('.cr-frame__content') || it;
       body = (c.innerText || c.textContent || '').trim();
     } else {
       continue;
     }
-    if (body) out.push({role: isUser ? 'user' : 'assistant', text: body.slice(0, 4000)});
+    if (body) {
+      // 尾部保留：[[NEXT]] 一定在回复最末尾，按头部截断会把它切掉。
+      const CAP = 12000;
+      if (body.length > CAP) body = '…' + body.slice(-CAP);
+      out.push({role: isUser ? 'user' : 'assistant', text: body});
+    }
   }
   return out.length ? JSON.stringify(out) : null;
 })()
@@ -517,6 +532,11 @@ def _ensure_conversation_open(prompt_hint: str = "") -> bool:
     自动迭代会把过期上下文当成本轮产出推进。"""
     hint = (prompt_hint or "").strip()
     if hint:
+        # 先复用当前已打开的会话：若它就是本轮会话（包含完整提示词），
+        # 直接返回，省掉"点会话列表"这一步。CDP 不可达时点列表要盲试
+        # 多个端口（实测 ~18s），会拖慢每轮捕获并让流式测试超时。
+        if _in_conversation_page() and _conversation_has_prompt(hint):
+            return True
         # 会话卡片标题只显示开头若干字，取多级前缀逐一尝试
         for kw in filter(None, (hint[:24], hint[:16], hint[:8])):
             if _open_conversation_by_title(kw):
@@ -621,8 +641,6 @@ def _find_reply_after(conv, prompt_hint: str):
     匹配不上时返回 (None, reason)，调用方判定为「读不到」，绝不拿别人的回复冒进。"""
     assistants = [m for m in conv
                   if m.get("role") == "assistant" and (m.get("text") or "").strip()]
-    users = [m for m in conv
-             if m.get("role") == "user" and (m.get("text") or "").strip()]
     if not assistants:
         return None, "no-assistant"
     hint = _norm_for_match(prompt_hint)
@@ -630,29 +648,46 @@ def _find_reply_after(conv, prompt_hint: str):
         # 没有提示词可用时只能退回最后一条（调用方多数场景已带 hint）
         return assistants[-1]["text"], ""
     key = hint[:48] if len(hint) > 48 else hint
-    # 从后往前找包含本轮提示词的用户消息（提示词可能被截断/改写）
+    # 从后往前找包含本轮提示词的用户消息（提示词可能被截断/改写）。
+    # 必须记录 conv 中的原始下标：同一个提示词可能在多轮里重复出现
+    # （autopilot 的兜底方向每轮文本相同），用 conv.index(dict) 会命中
+    # 第一个相等对象，从而读到首轮的旧回复，迭代就会原地打转。
     idx = None
-    for i in range(len(users) - 1, -1, -1):
-        u = _norm_for_match(users[i]["text"])
+    for i in range(len(conv) - 1, -1, -1):
+        m = conv[i]
+        if m.get("role") != "user" or not (m.get("text") or "").strip():
+            continue
+        u = _norm_for_match(m["text"])
         if key and (key in u or u[-len(key):] == key):
             idx = i
             break
     if idx is None:
         # 更宽松：用户首句与提示词开头重合
         head = hint[:_HINT_MIN_OVERLAP]
-        for i in range(len(users) - 1, -1, -1):
-            u = _norm_for_match(users[i]["text"])
+        for i in range(len(conv) - 1, -1, -1):
+            m = conv[i]
+            if m.get("role") != "user" or not (m.get("text") or "").strip():
+                continue
+            u = _norm_for_match(m["text"])
             if u.startswith(head) or head in u:
                 idx = i
                 break
     if idx is None:
         return None, "prompt-not-found"
-    # 取该用户消息之后的第一条助手消息
-    after = [m for m in assistants
-             if conv.index(m) > conv.index(users[idx])]
+    # 取该用户消息之后、下一条用户消息之前的全部助手消息。
+    # 一轮回复可能被 DOM 拆成多个助手条目（思考/工具/最终正文）；
+    # 只取第一条会读到中间态，末尾的 [[NEXT]] 永远丢失。
+    start = idx
+    end = len(conv)
+    for j in range(start + 1, len(conv)):
+        if conv[j].get("role") == "user" and (conv[j].get("text") or "").strip():
+            end = j
+            break
+    after = [m for m in conv[start + 1:end]
+             if m.get("role") == "assistant" and (m.get("text") or "").strip()]
     if not after:
         return None, "no-reply-after-prompt"
-    return after[0]["text"], ""
+    return "\n\n".join(m["text"].strip() for m in after), ""
 
 
 def _read_last_agent_reply(prompt_hint: str = ""):
@@ -686,11 +721,18 @@ def last_assistant_message(timeout=240, poll=15, prompt_hint=""):
         # 绝不留在无关会话里轮询——那只会白等并可能读到过期回复。
         return None
     deadline = time.time() + max(poll, timeout)
+    prev = None
     while time.time() < deadline:
         raw = _read_last_agent_reply(prompt_hint)
         if raw and not _agent_still_generating():
-            # 助手气泡已生成完成，可安全返回
-            return raw
+            # 二次护栏：即使状态行识别失败，也要求连续两次读到同一段文本，
+            # 避免把流式输出的第一段思考文字当成本轮最终回复（丢 [[NEXT]]）。
+            if raw == prev:
+                return raw
+            prev = raw
+        else:
+            # 仍在生成 / 暂时读不到：清空基线，防止拿"暂停的中间态"误判为稳定
+            prev = None
         # 尚未生成完成：绝不在超时后返回半截内容，
         # 否则自动迭代会拿流式输出的一半当成本轮产出，污染后续提示词。
         time.sleep(poll)
@@ -698,15 +740,37 @@ def last_assistant_message(timeout=240, poll=15, prompt_hint=""):
 
 
 def _agent_still_generating() -> bool:
-    """最后一个助手气泡是否仍在输出中（有"停止"按钮/生成中状态）。"""
+    """最后一条助手回复是否仍在输出中。
+
+    真实事故（2026-10-31 夜间）：WorkBuddy 5.6.2 处理中时状态行是
+    `.cr-agent__processing-status`，只有**完成后**才换成
+    `.cr-agent__completion-status`；旧实现只查后者，查不到就返回 False，
+    于是把「深度思考中」/第一段思考文字当成已完成的回复交给迭代引擎，
+    连续 3 轮读不到末尾的 [[NEXT]]，活动被自动暂停、整夜空转。
+
+    新判定顺序：
+      1) 最后一条消息里任何 agent 带 data-message-processing="true" → 生成中；
+      2) 存在 .cr-agent__processing-status → 生成中；
+      3) 存在 .cr-agent__completion-status → 已完成；
+      4) 结构不认识时，退回状态行文案（含「思考/生成/加载」即视为生成中）。
+    """
     js = r"""
     (() => {
-      const agents = [...document.querySelectorAll('.cr-agent')];
+      const items = [...document.querySelectorAll(
+          '.cr-document__virtual-item, .cr-message-list__content > *')];
+      if (!items.length) return false;
+      const turn = items[items.length - 1];
+      if (turn.querySelector('[data-message-processing="true"]')) return true;
+      const agents = [...turn.querySelectorAll('.cr-agent')];
       if (!agents.length) return false;
-      const st = agents[agents.length - 1].querySelector('.cr-agent__completion-status');
-      if (!st) return false;
-      const t = (st.textContent || '').trim();
-      return /生成中|进行中|思考|加载|loading|\u2026/.test(t) || t === '';
+      const last = agents[agents.length - 1];
+      if (last.querySelector('.cr-agent__processing-status')) return true;
+      if (last.querySelector('.cr-agent__completion-status')) return false;
+      const st = last.querySelector(
+          '.cr-agent__header, [class*="processing-status"], [class*="completion-status"]');
+      const t = st ? (st.textContent || '').trim() : '';
+      if (/生成中|进行中|思考|加载|loading|停止/.test(t)) return true;
+      return false;
     })()
     """
     try:
