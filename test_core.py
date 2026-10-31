@@ -2489,6 +2489,42 @@ check("40c 前置失败→返回 0 且不创建活动",
 core._cdp_ready = _orig_ready40
 fresh_state()
 
+# ================================================================ 41. 发送早退必须还原剪贴板
+print("\n=== 41. 发送失败分支还原用户剪贴板 ===")
+_rec41 = {"sets": []}
+_orig_get41 = core._get_clipboard_text
+_orig_set41 = core.set_clipboard_text
+_orig_find41 = core._find_window_by_title
+_orig_act41 = core._activate_window
+core._get_clipboard_text = lambda: "USER_CLIP"
+core.set_clipboard_text = lambda t: (_rec41["sets"].append(t) or True)
+core._find_window_by_title = lambda s: None
+_ok41, _msg41 = core.auto_send_to_workbuddy("早退测试内容", reuse_conversation=True)
+check("41a 找不到窗口→早退且剪贴板已还原",
+      _ok41 is False and _rec41["sets"] == ["早退测试内容", "USER_CLIP"],
+      f"调用={_rec41['sets']!r}")
+_rec41["sets"] = []
+core._find_window_by_title = lambda s: 1
+core._activate_window = lambda h: False
+_ok41b, _ = core.auto_send_to_workbuddy("激活失败内容", reuse_conversation=True)
+check("41b 激活失败→早退且剪贴板已还原",
+      _ok41b is False and _rec41["sets"] == ["激活失败内容", "USER_CLIP"],
+      f"调用={_rec41['sets']!r}")
+_rec41["sets"] = []
+core._restore_clipboard("")
+check("41c 原本剪贴板为空→不做多余写入", _rec41["sets"] == [])
+core.set_clipboard_text = lambda t: (_ for _ in ()).throw(RuntimeError("boom"))
+try:
+    core._restore_clipboard("X")
+    _r41c = True
+except Exception:
+    _r41c = False
+check("41d 还原剪贴板异常不外抛", _r41c is True)
+core._get_clipboard_text = _orig_get41
+core.set_clipboard_text = _orig_set41
+core._find_window_by_title = _orig_find41
+core._activate_window = _orig_act41
+
 # ================================================================ 汇总
 print("\n" + "=" * 56)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")

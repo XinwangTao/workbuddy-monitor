@@ -2050,6 +2050,19 @@ def conversation_reuse_for_task(task_id, state) -> bool:
     return False
 
 
+def _restore_clipboard(prev: str):
+    """还原发送前用户的剪贴板。任何失败分支都必须走这里。
+
+    真实缺陷：旧代码只在「回车成功」路径还原剪贴板；找不到窗口、激活失败、
+    前台校验失败、粘贴失败等早退分支会把用户的剪贴板永久替换成任务文本。"""
+    if not prev:
+        return
+    try:
+        set_clipboard_text(prev)
+    except Exception:
+        pass
+
+
 def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
                            model: str = "", reuse_conversation: bool = False) -> tuple:
     """复制到剪贴板 → 激活 WorkBuddy → 粘贴 → 回车发送。
@@ -2074,15 +2087,19 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
         pass
     prev_clip = _get_clipboard_text()
     if not set_clipboard_text(content):
+        _restore_clipboard(prev_clip)
         return False, "写入剪贴板失败"
     hwnd = _find_window_by_title(window_title)
     if not hwnd:
+        _restore_clipboard(prev_clip)
         return False, f"未找到标题含「{window_title}」的窗口"
     if not _activate_window(hwnd):
+        _restore_clipboard(prev_clip)
         return False, "无法激活 WorkBuddy 窗口"
     time.sleep(0.5)
     # 发送前二次确认前台就是目标窗口，防止把内容打进无关应用
     if user32.GetForegroundWindow() != hwnd:
+        _restore_clipboard(prev_clip)
         return False, "前台窗口校验失败，取消发送"
     # 关键修复 1：激活窗口 ≠ 焦点在输入框。真实出现过「窗口在前台但
     # Ctrl+V 落空」的情况。用 CDP 直接把光标放回编辑器，再粘贴。
@@ -2107,6 +2124,7 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
             if model:
                 ok_m, why_m = workbuddy_cdp.select_model(model)
                 if not ok_m:
+                    _restore_clipboard(prev_clip)
                     return False, f"新会话中模型重选失败: {why_m}"
                 log(f"新会话中已重新选择模型 {model}")
         else:
@@ -2145,12 +2163,12 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
             _ctrl_v()
             time.sleep(1.0)
         if not _editor_has_text(content) and not injected:
+            _restore_clipboard(prev_clip)
             return False, "粘贴未生效（内容未进入输入框），已取消发送"
     _enter()
     time.sleep(2.0)  # WorkBuddy 提交后要建会话/回列表，立即读会读到空页
     # 还原用户剪贴板
-    if prev_clip:
-        set_clipboard_text(prev_clip)
+    _restore_clipboard(prev_clip)
     # 发送后确认：输入框应被清空（消息已提交）。
     # 真实缺陷：回车没提交时草稿留在编辑器里，只报失败不清掉的话，下一轮重试会
     # 把新内容追加到旧草稿之后，发出去的是「旧稿+新内容」拼的那条，且幂等去重
