@@ -1819,6 +1819,16 @@ kernel32.GetCurrentThreadId.restype = ctypes.c_uint
 kernel32.GetCurrentThreadId.argtypes = ()
 user32.BringWindowToTop.restype = ctypes.c_int
 user32.BringWindowToTop.argtypes = (ctypes.c_void_p,)
+# 窗口归属校验用：按 hwnd 取进程映像名 / 窗口类名
+kernel32.OpenProcess.restype = ctypes.c_void_p
+kernel32.OpenProcess.argtypes = (_wt.DWORD, _wt.BOOL, _wt.DWORD)
+kernel32.QueryFullProcessImageNameW.restype = _wt.BOOL
+kernel32.QueryFullProcessImageNameW.argtypes = (
+    ctypes.c_void_p, _wt.DWORD, _wt.LPWSTR, ctypes.POINTER(_wt.DWORD))
+kernel32.CloseHandle.restype = _wt.BOOL
+kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+user32.GetClassNameW.restype = ctypes.c_int
+user32.GetClassNameW.argtypes = (ctypes.c_void_p, _wt.LPWSTR, ctypes.c_int)
 
 
 def set_clipboard_text(text: str) -> bool:
@@ -1841,8 +1851,70 @@ def set_clipboard_text(text: str) -> bool:
         user32.CloseClipboard()
 
 
+_WINDOW_CLASS_BLOCKLIST = {
+    "consolewindowclass", "cascadia_hosting_window_class",
+    "mintty", "putty", "windowsterminal", "sunawtframe",
+}
+
+
+def _window_process_name(hwnd) -> str:
+    """窗口所属进程的映像名（小写，如 workbuddy.exe）；取不到返回空串。"""
+    try:
+        pid = _wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return ""
+        h = kernel32.OpenProcess(0x1000, False, pid.value)  # QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = _wt.DWORD(1024)
+            if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return os.path.basename(buf.value).lower()
+        finally:
+            kernel32.CloseHandle(h)
+    except Exception:
+        pass
+    return ""
+
+
+def _window_class_name(hwnd) -> str:
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buf, 256)
+        return (buf.value or "").lower()
+    except Exception:
+        return ""
+
+
+def _window_is_candidate(title, cls, exe, want="workbuddy") -> bool:
+    """该窗口是否真的是 WorkBuddy 主窗口。
+
+    真实事故（2026-10-31）：Claude Code 会话标题叫
+    「◑ Workbuddy夜间模型自我迭代项目卡点」，旧实现只做子串匹配，
+    `_find_window_by_title("WorkBuddy")` 命中了这个终端，
+    自动化把测试夹具文本粘贴+回车进了正在使用的对话。
+
+    三重判定：标题必须以应用名开头（不是任意位置包含）、
+    窗口类不能是终端/控制台、进程映像名必须是 workbuddy.exe（能取到时）。
+    """
+    t = (title or "").strip().lower()
+    w = (want or "workbuddy").strip().lower()
+    c = (cls or "").strip().lower()
+    e = (exe or "").strip().lower()
+    if not (t == w or t.startswith(w + " ") or t.startswith(w + "-")
+            or t.startswith(w + "—") or t.startswith(w + "(")):
+        return False
+    if c in _WINDOW_CLASS_BLOCKLIST:
+        return False
+    if e and "workbuddy" not in e:
+        return False
+    return True
+
+
 def _find_window_by_title(substr: str):
-    """枚举顶层窗口，返回标题包含 substr 的第一个可见窗口句柄"""
+    """枚举顶层窗口，返回真正的 WorkBuddy 窗口句柄（排除终端/路径同名窗口）。"""
     result = []
     @ctypes.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM)
     def cb(hwnd, _):
@@ -1850,7 +1922,8 @@ def _find_window_by_title(substr: str):
             n = user32.GetWindowTextLengthW(hwnd)
             buf = ctypes.create_unicode_buffer(n + 1)
             user32.GetWindowTextW(hwnd, buf, n + 1)
-            if substr.lower() in buf.value.lower():
+            if _window_is_candidate(buf.value, _window_class_name(hwnd),
+                                    _window_process_name(hwnd), substr):
                 result.append(hwnd)
         return True
     user32.EnumWindows(cb, 0)

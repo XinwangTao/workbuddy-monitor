@@ -31,6 +31,20 @@ core.TASKS_ARCHIVE_FILE = _TMP / "state.tasks-archive.jsonl"
 core.CONFIG_FILE = _TMP / "config.json"
 core.LOG_FILE = _TMP / "monitor.log"
 
+# ---------------------------------------------------------------- 安全隔离（硬性）
+# 测试绝不能触发真实剪贴板/键盘/窗口自动化。
+# 真实事故（2026-10-31）：当前 Claude Code 会话标题是
+# 「◑ Workbuddy夜间模型自我迭代项目卡点」，旧 _find_window_by_title 只做子串
+# 匹配，测试里的 send_task 把夹具文本粘贴+回车进了正在使用的对话。
+# 这里把 OS 副作用全部换成桩；_find_window_by_title 返回当前前台句柄，
+# 使 auto_send 的“前台校验”在无副作用的前提下通过。
+core.set_clipboard_text = lambda text: True
+core._get_clipboard_text = lambda: ""
+core._find_window_by_title = lambda substr: core.user32.GetForegroundWindow()
+core._activate_window = lambda hwnd: True
+core._ctrl_v = lambda: None
+core._enter = lambda: None
+
 # ---------------------------------------------------------------- 伪造 CDP
 FAKE = {
     "models": [],
@@ -2335,6 +2349,25 @@ check("37e 超过 max_keep→从最旧开始归档，只留最新 N 条",
 fresh_state()
 if core.TASKS_ARCHIVE_FILE.exists():
     core.TASKS_ARCHIVE_FILE.unlink()
+
+# ================================================================ 38. 窗口归属判定（禁止把终端当 WorkBuddy）
+print("\n=== 38. 窗口归属：只认 WorkBuddy 自己的窗口，拒绝同名终端 ===")
+_wi = core._window_is_candidate
+check("38a 标题含 workbuddy 的终端窗口被拒绝（真实事故）",
+      _wi("◑ Workbuddy夜间模型自我迭代项目卡点",
+          "CASCADIA_HOSTING_WINDOW_CLASS", "windowsterminal.exe") is False)
+check("38b 真正的 WorkBuddy 主窗口放行",
+      _wi("WorkBuddy", "Chrome_WidgetWin_1", "workbuddy.exe") is True)
+check("38c WorkBuddy 带后缀标题放行",
+      _wi("WorkBuddy - 加油站", "Chrome_WidgetWin_1", "workbuddy.exe") is True)
+check("38d 标题仅中间包含 workbuddy→拒绝（不再做任意子串匹配）",
+      _wi("我的 workbuddy 项目", "Chrome_WidgetWin_1", "workbuddy.exe") is False)
+check("38e 终端类名一律拒绝",
+      _wi("WorkBuddy", "ConsoleWindowClass", "workbuddy.exe") is False)
+check("38f 进程不是 WorkBuddy→拒绝",
+      _wi("WorkBuddy", "Chrome_WidgetWin_1", "chrome.exe") is False)
+check("38g 取不到进程名时退回前缀规则放行",
+      _wi("WorkBuddy", "SomeClass", "") is True)
 
 # ================================================================ 汇总
 print("\n" + "=" * 56)
