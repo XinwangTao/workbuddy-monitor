@@ -27,6 +27,7 @@ import workbuddy_cdp as cdp  # noqa: E402
 # ---------------------------------------------------------------- 环境隔离
 _TMP = Path(tempfile.mkdtemp(prefix="wbmon_test_"))
 core.STATE_FILE = _TMP / "state.json"
+core.TASKS_ARCHIVE_FILE = _TMP / "state.tasks-archive.jsonl"
 core.CONFIG_FILE = _TMP / "config.json"
 core.LOG_FILE = _TMP / "monitor.log"
 
@@ -2275,6 +2276,65 @@ _dup2 = real_cdp._read_last_agent_reply("同一个提示词")
 check("36b 重复提示词跨多轮→仍取最后一次出现的回复",
       _dup2 == "第三轮", f"实际={_dup2!r}")
 real_cdp.read_conversation = _real_read36
+
+# ================================================================ 37. 任务表清理（只归档已结束旧任务）
+print("\n=== 37. 任务表清理：归档旧任务但不碰 pending/在途 ===")
+fresh_state()
+if core.TASKS_ARCHIVE_FILE.exists():
+    core.TASKS_ARCHIVE_FILE.unlink()
+
+
+def _mk_task(tid, status, created):
+    return {"id": tid, "content": f"任务{tid}", "model": "", "status": status,
+            "created": created, "scheduled_time": None, "allow_credit": False}
+
+
+_old = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
+_recent = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+_st37 = fresh_state()
+_st37["tasks"] = [
+    _mk_task(1, "failed", _old),      # 旧 failed → 应归档
+    _mk_task(2, "sent", _old),        # 旧 sent，但被活动引用 → 保留
+    _mk_task(3, "pending", _old),     # pending → 永不归档
+    _mk_task(4, "failed", _recent),   # 未过期 → 保留
+    _mk_task(5, "failed", ""),        # 无创建时间 → 不按时间归档
+]
+core.save_state(_st37)
+_c37 = core.create_campaign(core.load_state(), "清理保护测试", strategy="improve")
+_st37 = core.load_state()
+core.campaign_by_id(_st37, _c37["id"])["last_task_id"] = 2
+core.save_state(_st37)
+_n37 = core.prune_old_tasks(core.load_state(),
+                            {"task_retention_days": 7, "task_max_keep": 500})
+_ids37 = [t["id"] for t in core.load_state()["tasks"]]
+check("37a 只归档过期 failed（1 条）", _n37 == 1, f"归档数={_n37}")
+check("37b pending/在途引用/未过期/无时间戳全部保留",
+      _ids37 == [2, 3, 4, 5], f"实际={_ids37}")
+_arch37 = core.TASKS_ARCHIVE_FILE.read_text(encoding="utf-8") if core.TASKS_ARCHIVE_FILE.exists() else ""
+check("37c 归档文件含被清理任务", '"id": 1' in _arch37 or '"id":1' in _arch37, _arch37[:120])
+check("37d 重复执行幂等（无更多可归档）",
+      core.prune_old_tasks(core.load_state(),
+                           {"task_retention_days": 7, "task_max_keep": 500}) == 0)
+
+# 总量上限：即使未过期，超过 max_keep 也从最旧已结束任务开始归档
+fresh_state()
+if core.TASKS_ARCHIVE_FILE.exists():
+    core.TASKS_ARCHIVE_FILE.unlink()
+_st37b = fresh_state()
+_st37b["tasks"] = [
+    _mk_task(10 + i, "sent",
+             (datetime.now() - timedelta(days=5 - i)).strftime("%Y-%m-%d %H:%M:%S"))
+    for i in range(5)
+]
+core.save_state(_st37b)
+_n37b = core.prune_old_tasks(core.load_state(),
+                             {"task_retention_days": 7, "task_max_keep": 2})
+_ids37b = sorted(t["id"] for t in core.load_state()["tasks"])
+check("37e 超过 max_keep→从最旧开始归档，只留最新 N 条",
+      _n37b == 3 and _ids37b == [13, 14], f"归档数={_n37b} 保留={_ids37b}")
+fresh_state()
+if core.TASKS_ARCHIVE_FILE.exists():
+    core.TASKS_ARCHIVE_FILE.unlink()
 
 # ================================================================ 汇总
 print("\n" + "=" * 56)

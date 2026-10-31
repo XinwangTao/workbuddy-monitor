@@ -1,6 +1,7 @@
 # 用户私有数据，不上传
 config.json
 state.json
+state.tasks-archive.jsonl
 monitor.log
 __pycache__/
 *.pyc

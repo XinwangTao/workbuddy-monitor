@@ -39,6 +39,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.json"
 STATE_FILE = BASE_DIR / "state.json"
+TASKS_ARCHIVE_FILE = BASE_DIR / "state.tasks-archive.jsonl"
 LOG_FILE = BASE_DIR / "monitor.log"
 
 DEFAULT_CONFIG = {
@@ -60,6 +61,10 @@ DEFAULT_CONFIG = {
     },
     # 轮询间隔（秒）
     "poll_interval": 30,
+    # 任务表保留策略：超过 N 天的已结束任务（sent/failed）移到归档文件；
+    # 总量超过 max_keep 时也从最旧的已结束任务开始归档。pending 永不清理。
+    "task_retention_days": 7,
+    "task_max_keep": 500,
     # Windows 通知标题
     "notify_title": "WorkBuddy 监控",
     # 到点自动发送到 WorkBuddy 窗口（复制到剪贴板 + 粘贴 + 回车）
@@ -960,6 +965,81 @@ def pending_tasks(state: dict, model: str = ""):
 
 
 TASK_CLAIM_TTL = 120  # 秒：发送认领的过期时间（防进程崩溃后任务永久卡住）
+
+
+def _task_created_dt(t):
+    """任务创建时间；缺失/非法返回 None（这类任务不参与按时间归档）。"""
+    try:
+        return datetime.strptime(t.get("created", ""), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def prune_old_tasks(state, cfg=None, now=None):
+    """把已结束的旧任务移到归档 JSONL，返回归档条数。
+
+    背景：state.json 长期运行会累积数百条 failed/sent 任务（实测 423 条/778KB），
+    每次读盘、写盘、GUI 刷新都要为历史失败买单。
+    安全边界：pending 永不归档；被任何活动 last_task_id 引用的任务永不归档；
+    只追加到独立归档文件，不改写/删除原始记录；写归档失败则整体放弃本次清理。
+    """
+    cfg = cfg or {}
+    now = now or datetime.now()
+    try:
+        keep_days = int(cfg.get("task_retention_days", 7))
+    except (TypeError, ValueError):
+        keep_days = 7
+    try:
+        max_keep = int(cfg.get("task_max_keep", 500))
+    except (TypeError, ValueError):
+        max_keep = 500
+    cutoff = now - timedelta(days=max(0, keep_days))
+    with state_lock():
+        fresh = load_state()
+        tasks = fresh.get("tasks", [])
+        protect = {c.get("last_task_id") for c in fresh.get("campaigns", [])
+                   if c.get("last_task_id")}
+        kept, archive = [], []
+        for t in tasks:
+            if t.get("status") == "pending" or t.get("id") in protect:
+                kept.append(t)
+                continue
+            created = _task_created_dt(t)
+            if created is not None and created < cutoff:
+                archive.append(t)
+            else:
+                kept.append(t)
+        # 总量上限：仍超限时，从最旧的已结束任务开始归档
+        if len(kept) > max_keep:
+            cand = []
+            for i, t in enumerate(kept):
+                if t.get("status") == "pending" or t.get("id") in protect:
+                    continue
+                created = _task_created_dt(t)
+                if created is not None:
+                    cand.append((created, i, t))
+            cand.sort(key=lambda x: (x[0], x[1]))
+            excess = len(kept) - max_keep
+            drop = {id(x[2]) for x in cand[:max(0, excess)]}
+            archive.extend(t for t in kept if id(t) in drop)
+            kept = [t for t in kept if id(t) not in drop]
+        if not archive:
+            return 0
+        try:
+            TASKS_ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(TASKS_ARCHIVE_FILE, "a", encoding="utf-8") as f:
+                for t in archive:
+                    f.write(json.dumps(t, ensure_ascii=False) + "\n")
+        except Exception as e:
+            log(f"任务归档失败，取消本次清理（state 未改动）: {e}")
+            return 0
+        fresh["tasks"] = kept
+        save_state(fresh)
+        if state is not None:
+            state["tasks"] = kept
+        log(f"任务表清理：归档 {len(archive)} 条已结束任务 → "
+            f"{TASKS_ARCHIVE_FILE.name}，保留 {len(kept)} 条")
+        return len(archive)
 
 
 def _claim_task_for_send(task_id, ttl: int = TASK_CLAIM_TTL) -> bool:
@@ -2459,6 +2539,18 @@ def monitor_tick(cfg: dict, now=None) -> dict:
     info = {"sent": 0, "blocked": 0, "iterated": False, "guard_paused": False,
             "in_free_window": False, "errors": []}
     state = load_state()
+    # 每天一次任务表清理：把已结束的旧任务归档，避免 state.json 无限膨胀。
+    # pending 与在途活动引用的任务受保护，不参与清理。
+    today = now.strftime("%Y-%m-%d")
+    if state.get("tasks_pruned_date") != today:
+        try:
+            prune_old_tasks(state, cfg, now)
+            state = load_state()
+            state["tasks_pruned_date"] = today
+            save_state(state)
+        except Exception as e:
+            info["errors"].append(f"prune_tasks: {e}")
+            log(f"任务表清理异常(已跳过): {e}")
     try:
         check_rate_limits(state, cfg)
     except Exception as e:
