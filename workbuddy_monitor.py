@@ -692,14 +692,20 @@ def effective_free_window(state: dict, model: str = None, cfg: dict = None) -> d
 
 
 def in_window(win: dict, now=None) -> bool:
-    """win: {start, end} 支持跨午夜。未配置返回 True。"""
+    """win: {start, end} 支持跨午夜。未配置（空 win）返回 True。
+
+    非法/越界时间一律判窗口外（fail-closed）。这是发送门控里
+    「不在免费时段」的唯一拦截依据：若解析失败仍按"未配置"返回 True，
+    白天也会被当成免费窗口内而放行发送，直接扣积分。"""
     if not win:
         return True
     try:
         sh, sm = map(int, str(win.get("start", "23:00")).split(":"))
         eh, em = map(int, str(win.get("end", "08:00")).split(":"))
-    except (ValueError, AttributeError):
-        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+    if not (0 <= sh <= 23 and 0 <= eh <= 23 and 0 <= sm <= 59 and 0 <= em <= 59):
+        return False
     now = now or datetime.now()
     cur = now.hour * 60 + now.minute
     s, e = sh * 60 + sm, eh * 60 + em

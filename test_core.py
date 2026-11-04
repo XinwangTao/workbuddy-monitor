@@ -2631,6 +2631,45 @@ check("43f 夜间活动默认绑定仓库与测试命令",
       f"实际={(_c43b or {}).get('repo_path')!r} / {(_c43b or {}).get('test_cmd')!r}")
 fresh_state()
 
+# ================================================================ 44. 非法免费窗口必须 fail-closed
+print("\n=== 44. 非法免费窗口时间不得放行发送（安全红线）===")
+# 真实来源：_parse_window_from_text / CDP DOM 发现 / 用户手改 config 都可能给出
+# 带秒或越界的时间。旧 in_window 解析失败时 return True（"未配置"语义被滥用），
+# 而 _gate_static_reason 只靠 in_window 拦截「不在免费时段」——
+# 于是白天也会被判成免费窗口内，free_gate_reason 返回空 → 真扣积分。
+_bad_wins44 = [
+    ("带秒的非法格式", {"start": "23:00:30", "end": "08:00"}),
+    ("完全非时间文本", {"start": "not-a-time", "end": "08:00"}),
+    ("小时越界", {"start": "25:00", "end": "01:00"}),
+    ("分钟越界", {"start": "23:99", "end": "08:00"}),
+    ("负数小时", {"start": "-1:00", "end": "08:00"}),
+]
+for _label44, _w44 in _bad_wins44:
+    try:
+        _got44 = core.in_window(_w44, t_at(14, 0))
+    except Exception as _e44:
+        _got44 = f"RAISE {type(_e44).__name__}: {_e44}"
+    check(f"44a {_label44}→判窗口外(False)", _got44 is False, f"实际={_got44!r}")
+
+# 端到端钉住后果：非法窗口不得让发送门控在免费窗口外放行
+_st44 = fresh_state()
+_st44["model_catalog"] = [{"name": "Hy4", "free": True, "multiplier": 0.29}]
+_st44["free_info"] = {
+    "models_discovered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "window": {"start": "23:00:30", "end": "08:00", "source": "discovered"},
+}
+_cfg44 = cfg_of(free_only=True)
+_now44 = t_at(14, 0)
+_reason44 = core.free_gate_reason("Hy4", _st44, _cfg44, _now44)
+check("44b 白天+非法窗口→free_gate_reason 必须非空",
+      _reason44 != "", f"实际={_reason44!r}")
+check("44c 白天+非法窗口→task_sendable_now 必须 False",
+      core.task_sendable_now({"model": "Hy4"}, _st44, _cfg44, _now44) is False)
+# 回归保护：合法窗口与"未配置"的原有语义不得被改坏
+check("44d 合法跨午夜窗口仍正确",
+      core.in_window(W, t_at(23, 30)) is True and core.in_window(W, t_at(14, 0)) is False)
+check("44e 未配置窗口仍视为不限制", core.in_window({}, t_at(14, 0)) is True)
+
 # ================================================================ 汇总
 print("\n" + "=" * 56)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")
