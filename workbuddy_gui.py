@@ -244,12 +244,19 @@ class App:
         w = core.effective_free_window(state, None, self.cfg)
         win = f"{w.get('start')}-{w.get('end')}（来源:{w.get('source', '?')}）"
         free_models = [c["name"] for c in cat if c.get("free")]
+        # 目录可信度必须露在界面上：stale 时发送会被 fail-closed 拦下，
+        # 用户看不到原因只会以为"免费模型不能用"。
+        trust = core._catalog_trust(state, self.cfg)
+        trust_note = {
+            "stale": "   ⚠️ 目录已过期，发送会被拦截",
+            "unmarked": "   ⚠️ 目录缺少发现时间，发送会被拦截",
+        }.get(trust, "")
         if free_models:
             self.lbl_free.config(
-                text=f"🟢 免费模型: {', '.join(free_models)}   |   免费时段: {win}")
+                text=f"🟢 免费模型: {', '.join(free_models)}   |   免费时段: {win}{trust_note}")
         else:
             self.lbl_free.config(
-                text=f"免费时段: {win}（未识别免费模型，启动监控/点「发现免费」后可自动发现）")
+                text=f"免费时段: {win}（未识别免费模型，启动监控/点「发现免费」后可自动发现）{trust_note}")
 
     def refresh_iter(self):
         camps = core.ensure_campaigns(self.state)

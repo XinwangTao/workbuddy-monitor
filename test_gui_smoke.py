@@ -96,6 +96,38 @@ check("表格有渲染行", len(app.tree.get_children()) == 1,
       f"实际={len(app.tree.get_children())}")
 check("表格含'定时'列", "scheduled" in app.tree["columns"], f"实际={app.tree['columns']}")
 
+# 任务状态变化要能刷新到表格（发送成功/失败一眼可见）
+_task_id = st["tasks"][0]["id"]
+core.update_task(_task_id, status="sent")
+app.state = core.load_state()
+app.refresh_tasks(force=True)
+_rows = app.tree.get_children()
+_status_text = app.tree.item(_rows[0], "values")[4] if _rows else ""
+check("任务状态更新后表格显示已发送", "✅已发送" in _status_text, f"实际='{_status_text}'")
+
+# 免费目录可信度必须显示在界面（stale 会被 fail-closed，用户要能看到原因）
+from datetime import datetime, timedelta  # noqa: E402
+
+_st_free = core.load_state()
+_st_free["model_catalog"] = [{"name": "FreeA", "free": True, "multiplier": 0.0}]
+_st_free["free_info"] = {"models_discovered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+core.save_state(_st_free)
+app.state = core.load_state()
+app.refresh_free()
+_free_text = app.lbl_free.cget("text")
+check("新鲜目录→显示🟢免费模型且无过期告警",
+      "🟢" in _free_text and "FreeA" in _free_text and "过期" not in _free_text,
+      f"实际='{_free_text}'")
+
+_st_free["free_info"] = {"models_discovered_at":
+                         (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")}
+core.save_state(_st_free)
+app.state = core.load_state()
+app.refresh_free()
+check("过期目录→界面明确告警",
+      "目录已过期" in app.lbl_free.cget("text"),
+      f"实际='{app.lbl_free.cget('text')}'")
+
 # 迭代状态展示
 camp = core.create_campaign(core.load_state(), "冒烟迭代目标", strategy="autopilot")
 app.state = core.load_state()

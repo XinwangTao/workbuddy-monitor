@@ -289,7 +289,7 @@ python test_core.py          # 核心逻辑离线测试（433 项：fail-closed 
 python test_e2e_real.py      # 实测：无 CDP 时回退/免费门控/白天不发送
 python test_e2e_cdp.py       # 实测：注入 Fake CDP 的「夜间 hy4 免费」自动迭代闭环
 python test_e2e_hy3_day.py   # 实测：白天 hy3 免费自动迭代闭环（按模型专属时段自动选模型）
-python test_gui_smoke.py     # GUI 构建冒烟（15 项，需带 tkinter 的 Python；无 tkinter/无 DISPLAY 时自动跳过）
+python test_gui_smoke.py     # GUI 构建冒烟（18 项，需带 tkinter 的 Python；无 tkinter/无 DISPLAY 时自动跳过）
 ```
 
 发送/窗口/剪贴板依赖 Windows API；在非 Windows（CI 的 ubuntu runner）上模块可正常导入，这些路径按「不可用」返回失败，其余逻辑测试照常运行。
