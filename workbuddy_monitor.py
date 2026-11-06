@@ -3008,6 +3008,36 @@ def wait_for_cdp(timeout=300, poll=15) -> bool:
         time.sleep(max(0.0, float(poll)))
 
 
+NIGHT_CATALOG_RETRIES = 3
+NIGHT_CATALOG_RETRY_DELAY = 15
+
+
+def _ensure_night_catalog(cfg: dict, attempts: int = NIGHT_CATALOG_RETRIES,
+                          delay: float = NIGHT_CATALOG_RETRY_DELAY) -> tuple:
+    """夜间启动前确保免费模型目录可信（fresh）。
+
+    目录缺失、过期（stale）或无时间戳（unmarked）都触发重新发现；最多
+    attempts 次，每次之间等 delay 秒。返回 (state, trust)；trust 仍不是
+    'fresh' 时调用方必须 fail-closed 退出，不能带着不可信目录去发送——
+    那会直接扣积分。"""
+    state = load_state()
+    for i in range(1, attempts + 1):
+        if _catalog_trust(state, cfg) == "fresh":
+            return state, "fresh"
+        try:
+            discover_free_models(cfg, None)
+            discover_free_window(cfg, None)
+        except Exception as e:
+            log(f"夜间模式：免费发现失败（第 {i}/{attempts} 次）: {e}")
+        state = load_state()
+        if _catalog_trust(state, cfg) == "fresh":
+            log("夜间模式：免费目录已刷新")
+            return state, "fresh"
+        if i < attempts and delay > 0:
+            time.sleep(delay)
+    return state, _catalog_trust(state, cfg)
+
+
 def _run_night_runner_body(cfg: dict, goal: str, max_rounds: int = 20,
                            strategy: str = "autopilot") -> int:
     """夜间自动跑：创建/恢复 autopilot 迭代活动，免费窗口内持续推进。
@@ -3059,13 +3089,19 @@ def _run_night_runner_body(cfg: dict, goal: str, max_rounds: int = 20,
         if changed:
             save_state(state)
         log(f"夜间模式：复用 {len(running)} 个进行中的迭代活动")
-    if goal and not (state.get("model_catalog") or []):
-        # 首次跑目录为空时先做一次免费发现，避免第一轮就因目录过期暂停
+    # 目录「非空但过期」同样不可信：旧实现只在目录为空时发现一次，
+    # 过期目录会让第一轮 tick 直接 fail-closed 暂停活动、整夜空转。
+    state, trust = _ensure_night_catalog(cfg)
+    if trust != "fresh":
+        msg = (f"夜间前置检查失败：免费模型目录不可信（{trust}），已 fail-closed 退出，"
+               "本轮不发送任何请求以免扣积分。请确认 WorkBuddy 已登录、CDP 9224 "
+               "可用，手动运行 --discover 成功后重试。")
+        log(msg)
         try:
-            discover_free_models(cfg, None)
-            discover_free_window(cfg, None)
-        except Exception as e:
-            log(f"夜间模式：免费发现失败（将靠下一轮自愈）: {e}")
+            send_windows_notification(cfg.get("notify_title", "WorkBuddy 监控"), msg)
+        except Exception:
+            pass
+        return 0
 
     rounds = 0
     # 基线：启动时所有活动的累计轮数。进度只算本次运行期间的增量，

@@ -2670,6 +2670,122 @@ check("44d 合法跨午夜窗口仍正确",
       core.in_window(W, t_at(23, 30)) is True and core.in_window(W, t_at(14, 0)) is False)
 check("44e 未配置窗口仍视为不限制", core.in_window({}, t_at(14, 0)) is True)
 
+# ================================================================ 45. 夜间目录过期必须自愈/fail-closed
+print("\n=== 45. 夜间目录过期：要么刷新成功，要么 fail-closed 退出 ===")
+# 真实事故（2026-11-05 夜间活动 #1793891124509）：目录非空但已过期 18h，
+# 旧实现只在目录为空时发现 → 第一轮 tick 被 fail-closed 暂停，整夜空转。
+_orig_disc45 = core.discover_free_models
+_orig_discw45 = core.discover_free_window
+_orig_sleep45 = core.time.sleep
+_orig_tick45 = core.monitor_tick
+_orig_notify45 = core.send_windows_notification
+_orig_ifw45 = core.in_free_window
+_cfg45 = cfg_of()
+_cfg45["night_preflight"] = False
+_cfg45["poll_interval"] = 10
+
+
+def _stale45():
+    st = fresh_state()
+    st["model_catalog"] = [{"name": "Hy3", "free": True, "multiplier": 0.0}]
+    st["free_info"] = {"models_discovered_at":
+                       (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")}
+    core.save_state(st)
+    return st
+
+
+_st45a = _stale45()
+check("45a 非空但过期目录被判 stale",
+      core._catalog_trust(_st45a, _cfg45) == "stale")
+
+# A. 发现失败 → 重试后仍 stale（不能假装成功）
+_tries45 = {"n": 0}
+
+
+def _disc_fail45(cfg, state=None, force=False):
+    _tries45["n"] += 1
+    return None
+
+
+core.discover_free_models = _disc_fail45
+core.discover_free_window = lambda cfg, state=None, force=False: None
+core.time.sleep = lambda *a, **k: None
+try:
+    _st45b, _trust45b = core._ensure_night_catalog(_cfg45, attempts=3, delay=0)
+finally:
+    core.discover_free_models = _orig_disc45
+    core.discover_free_window = _orig_discw45
+    core.time.sleep = _orig_sleep45
+check("45b 发现失败→重试 3 次", _tries45["n"] == 3, f"实际={_tries45['n']}")
+check("45c 发现失败→trust 仍为 stale（fail-closed）", _trust45b == "stale",
+      f"实际={_trust45b!r}")
+
+# B. 第二次发现成功 → 转 fresh（自愈路径）
+_stale45()
+_seq45 = {"n": 0}
+
+
+def _disc_ok45(cfg, state=None, force=False):
+    _seq45["n"] += 1
+    if _seq45["n"] < 2:
+        return None
+    st = core.load_state()
+    st["model_catalog"] = [{"name": "Hy4", "free": True, "multiplier": 0.29}]
+    stamp(st)
+    core.save_state(st)
+    return st["model_catalog"]
+
+
+core.discover_free_models = _disc_ok45
+core.discover_free_window = lambda cfg, state=None, force=False: None
+core.time.sleep = lambda *a, **k: None
+try:
+    _st45c, _trust45c = core._ensure_night_catalog(_cfg45, attempts=3, delay=0)
+finally:
+    core.discover_free_models = _orig_disc45
+    core.discover_free_window = _orig_discw45
+    core.time.sleep = _orig_sleep45
+check("45d 第二次发现成功→目录转 fresh", _trust45c == "fresh",
+      f"实际={_trust45c!r}")
+
+# C. 端到端：目录刷新失败时夜间 runner 必须退出且一次 tick 都不跑
+_stale45()
+_tick45 = {"n": 0}
+_notified45 = []
+
+
+def _tick_should_not_run45(cfg, now=None):
+    _tick45["n"] += 1
+    return {"sent": 0, "blocked": 0, "iterated": True, "errors": []}
+
+
+def _notify45(title, body):
+    _notified45.append(body)
+    return True
+
+
+core.monitor_tick = _tick_should_not_run45
+core.in_free_window = lambda cfg, now=None, state=None: True
+core.discover_free_models = _disc_fail45
+core.discover_free_window = lambda cfg, state=None, force=False: None
+core.time.sleep = lambda *a, **k: None
+core.send_windows_notification = _notify45
+_tries45["n"] = 0
+try:
+    _r45 = core.run_night_runner(_cfg45, "目录过期目标", max_rounds=5)
+finally:
+    core.monitor_tick = _orig_tick45
+    core.in_free_window = _orig_ifw45
+    core.discover_free_models = _orig_disc45
+    core.discover_free_window = _orig_discw45
+    core.time.sleep = _orig_sleep45
+    core.send_windows_notification = _orig_notify45
+check("45e 目录不可信→runner 0 轮退出", _r45 == 0, f"实际={_r45!r}")
+check("45f 目录不可信→一次 tick 都没跑", _tick45["n"] == 0, f"实际={_tick45['n']}")
+check("45g 目录不可信→发出告警通知", len(_notified45) == 1 and "不可信" in _notified45[0],
+      f"实际={_notified45}")
+fresh_state()
+
 # ================================================================ 汇总
 print("\n" + "=" * 56)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")
