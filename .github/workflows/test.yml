@@ -1,0 +1,33 @@
+name: Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # tkinter 在 ubuntu runner 上默认缺失，test_gui_smoke.py 会自行跳过（exit 0），
+      # 其余测试均不依赖真实 WorkBuddy（CDP 用伪造模块注入）。
+      - name: Run test suite
+        run: |
+          python -m py_compile workbuddy_monitor.py workbuddy_cdp.py workbuddy_gui.py
+          python test_core.py
+          python test_e2e_real.py
+          python test_e2e_cdp.py
+          python test_e2e_hy3_day.py
+          python test_gui_smoke.py

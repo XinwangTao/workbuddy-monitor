@@ -1,0 +1,46 @@
+{
+  "name": "workbuddy-monitor_night_gate_workflow",
+  "title": "WorkBuddy 夜间自迭代：单决策者 + 独立验证闸门",
+  "level": "L1",
+  "version": 1,
+  "date": "2026-10-31",
+  "goal": "让“这一轮算不算成功”由可验证证据决定，而不是模型自述",
+  "nodes": [
+    {"id": "A", "type": "trigger", "label": "计划任务 23:05", "detail": "night_run.ps1 启动；启动 WorkBuddy 带 CDP"},
+    {"id": "B", "type": "decision", "label": "CDP 前置检查", "detail": "最多等 5 分钟；就绪才继续"},
+    {"id": "B1", "type": "exit", "label": "通知并退出", "detail": "写清原因，不创建空转活动"},
+    {"id": "C", "type": "decision", "label": "单实例锁", "detail": "同一时刻只允许一个决策者推进活动；GUI 只观察/控制"},
+    {"id": "C1", "type": "exit", "label": "让位退出", "detail": "已有决策者时不重复推进"},
+    {"id": "D", "type": "process", "label": "取当前活动与轮次", "detail": "只取 running 活动；目标/仓库/测试命令必须已绑定"},
+    {"id": "E", "type": "process", "label": "发送本轮任务", "detail": "免费门控 + 任务原子认领 + 剪贴板还原"},
+    {"id": "F", "type": "process", "label": "捕获完整回复", "detail": "生成态识别 + 文本稳定 + 完整 [[NEXT]]"},
+    {"id": "G", "type": "decision", "label": "独立验证闸门", "detail": "记录 HEAD_before → 监控器自己运行 test_cmd → 读退出码 → 记录 HEAD_after"},
+    {"id": "H", "type": "success", "label": "有效轮：记录证据并生成下一轮", "detail": "commit、测试输出、耗时写入 history；重置失败计数"},
+    {"id": "I", "type": "failure", "label": "无效轮：失败日志回灌，连续 3 次暂停", "detail": "把测试输出作为下一轮修复输入；连续 3 次无效则暂停并通知"},
+    {"id": "J", "type": "exit", "label": "窗口结束 / 达到阈值 → 释放锁并退出", "detail": "任一轮结束后若已出免费窗口，走此出口"}
+  ],
+  "edges": [
+    {"from": "A", "to": "B"},
+    {"from": "B", "to": "B1", "label": "超时"},
+    {"from": "B", "to": "C", "label": "就绪"},
+    {"from": "C", "to": "C1", "label": "已有 runner"},
+    {"from": "C", "to": "D", "label": "拿到锁"},
+    {"from": "D", "to": "E"},
+    {"from": "E", "to": "F"},
+    {"from": "F", "to": "G"},
+    {"from": "G", "to": "H", "label": "exit=0 且 HEAD 前进"},
+    {"from": "G", "to": "I", "label": "exit≠0 或 HEAD 未动"},
+    {"from": "H", "to": "D", "label": "仍在免费窗口"},
+    {"from": "I", "to": "D", "label": "连续失败 <3 且仍在窗口"},
+    {"from": "I", "to": "J", "label": "连续失败 ≥3"},
+    {"from": "D", "to": "J", "label": "窗口结束"},
+    {"from": "E", "to": "J", "label": "窗口结束"},
+    {"from": "F", "to": "J", "label": "窗口结束"},
+    {"from": "H", "to": "J", "label": "窗口结束"}
+  ],
+  "open_questions": [
+    {"id": 1, "question": "验证失败后是否把测试失败日志自动作为下一轮修复提示？", "default": "是，最多连续 3 轮，之后暂停"},
+    {"id": 2, "question": "“有效轮”标准是什么？", "default": "测试退出码=0 且 HEAD 前进（有新 commit）"},
+    {"id": 3, "question": "GUI 与夜间 runner 同时存在时谁优先？", "default": "夜间 runner 优先；GUI 检测到锁只观察不推进"}
+  ]
+}

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>WorkBuddy 夜间自迭代：单决策者 + 独立验证闸门</title>
+<style>
+  :root{--bg:#0f1419;--card:#1a222c;--line:#3a4a5c;--text:#e6edf3;--muted:#9aa7b4;--ok:#2ea043;--bad:#d1242f;--warn:#d29922;--accent:#58a6ff}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 "Segoe UI",system-ui,sans-serif;padding:28px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--muted);margin-bottom:20px}
+  .flow{display:flex;flex-direction:column;gap:0;max-width:920px}
+  .row{display:flex;gap:16px;align-items:stretch}
+  .node{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;min-width:280px;max-width:520px}
+  .node.trigger{border-color:var(--accent)}
+  .node.decision{border-color:var(--warn);border-radius:10px}
+  .node.ok{border-color:var(--ok)}
+  .node.bad{border-color:var(--bad)}
+  .k{font-weight:600}
+  .d{color:var(--muted);font-size:12.5px}
+  .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;background:#243040;color:var(--muted);margin-right:6px}
+  .arrow{height:26px;margin-left:22px;border-left:2px solid var(--line);position:relative}
+  .arrow:after{content:"";position:absolute;left:-5px;bottom:-1px;border:5px solid transparent;border-top-color:var(--line)}
+  .branch{display:flex;gap:28px;padding-left:6px}
+  .branch .label{color:var(--muted);font-size:12px;margin-bottom:4px}
+  .legend{display:flex;gap:18px;color:var(--muted);font-size:12px;margin:18px 0}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}
+  .q{margin-top:22px;background:#141b23;border:1px solid var(--line);border-radius:10px;padding:14px 18px}
+  .q h2{font-size:15px;margin:0 0 8px}
+  .q ol{margin:6px 0 0 18px;padding:0}
+  code{background:#243040;padding:1px 5px;border-radius:4px}
+</style>
+</head>
+<body>
+<h1>WorkBuddy 夜间自迭代：单决策者 + 独立验证闸门</h1>
+<div class="sub">L1 变更图 · 2026-10-31 · 目标：让“这一轮算不算成功”由可验证证据决定，而不是模型自述</div>
+
+<div class="legend">
+  <span><span class="dot" style="background:var(--accent)"></span>触发</span>
+  <span><span class="dot" style="background:var(--warn)"></span>判定</span>
+  <span><span class="dot" style="background:var(--ok)"></span>成功路径</span>
+  <span><span class="dot" style="background:var(--bad)"></span>失败/退出</span>
+</div>
+
+<div class="flow">
+  <div class="row"><div class="node trigger"><span class="tag">触发</span><span class="k">A. 计划任务 23:05</span><div class="d">night_run.ps1 启动；启动 WorkBuddy 带 CDP</div></div></div>
+  <div class="arrow"></div>
+
+  <div class="branch">
+    <div>
+      <div class="label">是</div>
+      <div class="node decision"><span class="tag">判定</span><span class="k">B. CDP 前置检查</span><div class="d">最多等 5 分钟；就绪才继续</div></div>
+    </div>
+    <div>
+      <div class="label">否（超时）</div>
+      <div class="node bad"><span class="tag">退出</span><span class="k">B1. 通知并退出</span><div class="d">写清原因，不创建空转活动</div></div>
+    </div>
+  </div>
+  <div class="arrow"></div>
+
+  <div class="branch">
+    <div>
+      <div class="label">拿到锁</div>
+      <div class="node decision"><span class="tag">判定</span><span class="k">C. 单实例锁</span><div class="d">同一时刻只允许一个决策者推进活动；GUI 只观察/控制</div></div>
+    </div>
+    <div>
+      <div class="label">已有 runner</div>
+      <div class="node bad"><span class="tag">退出</span><span class="k">C1. 让位退出</span><div class="d">记录“已有决策者”，不重复推进</div></div>
+    </div>
+  </div>
+  <div class="arrow"></div>
+
+  <div class="row"><div class="node"><span class="tag">过程</span><span class="k">D. 取当前活动与轮次</span><div class="d">只取 running 活动；目标/仓库/测试命令必须已绑定</div></div></div>
+  <div class="arrow"></div>
+
+  <div class="row"><div class="node"><span class="tag">过程</span><span class="k">E. 发送本轮任务</span><div class="d">免费门控 + 任务原子认领 + 剪贴板还原</div></div></div>
+  <div class="arrow"></div>
+
+  <div class="row"><div class="node"><span class="tag">过程</span><span class="k">F. 捕获完整回复</span><div class="d">生成态识别 + 文本稳定 + 完整 [[NEXT]]；不再只取第一段</div></div></div>
+  <div class="arrow"></div>
+
+  <div class="row"><div class="node decision"><span class="tag">判定（新增）</span><span class="k">G. 独立验证闸门</span><div class="d">记录 HEAD_before → 监控器自己运行 test_cmd → 读退出码 → 记录 HEAD_after</div></div></div>
+  <div class="arrow"></div>
+
+  <div class="branch">
+    <div>
+      <div class="label">通过：exit=0 且 HEAD 前进</div>
+      <div class="node ok"><span class="tag">有效轮</span><span class="k">H. 记录验证证据 → 生成下一轮</span><div class="d">commit、测试输出、耗时写入 history；重置失败计数</div></div>
+    </div>
+    <div>
+      <div class="label">失败：exit≠0 或 HEAD 未动</div>
+      <div class="node bad"><span class="tag">无效轮</span><span class="k">I. 失败日志回灌 → 连续 3 次暂停</span><div class="d">把测试输出作为下一轮修复输入；连续 3 次无效则暂停并通知</div></div>
+    </div>
+  </div>
+  <div class="arrow"></div>
+
+  <div class="row"><div class="node bad"><span class="tag">退出</span><span class="k">J. 窗口结束 / 达到阈值 → 释放锁并退出</span><div class="d">任一轮结束后若已出免费窗口，走此出口</div></div></div>
+</div>
+
+<div class="q">
+  <h2>待确认的 3 个决策</h2>
+  <ol>
+    <li><b>验证失败后的动作</b>：是否把测试失败日志自动作为下一轮修复提示？默认：<code>是，最多连续 3 轮，之后暂停</code>。</li>
+    <li><b>“有效轮”标准</b>：只要求测试退出码为 0，还是同时要求 <code>HEAD</code> 前进（有新 commit）？默认：<code>两者都要</code>。</li>
+    <li><b>GUI 与夜间 runner 同时存在</b>：谁优先？默认：<code>夜间 runner 优先；GUI 检测到锁只观察不推进</code>。</li>
+  </ol>
+</div>
+</body>
+</html>
