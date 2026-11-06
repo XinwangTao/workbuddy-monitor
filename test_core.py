@@ -751,9 +751,16 @@ import subprocess as _sp
 _gitdir = Path(tempfile.mkdtemp(prefix="wbgit_"))
 try:
     _sp.run(["git", "init", str(_gitdir)], capture_output=True, timeout=15, check=True)
+    # CI runner 没有全局 git 身份，commit 会静默失败 → 仓库没有 HEAD，
+    # 停滞检测拿不到基线。给临时仓库单独配置身份并把 commit 设为必须成功。
+    _sp.run(["git", "-C", str(_gitdir), "config", "user.email", "test@example.invalid"],
+            capture_output=True, timeout=15, check=True)
+    _sp.run(["git", "-C", str(_gitdir), "config", "user.name", "WorkBuddy Test"],
+            capture_output=True, timeout=15, check=True)
     (_gitdir / "seed.py").write_text("x = 1\n", encoding="utf-8")
     _sp.run(["git", "-C", str(_gitdir), "add", "-A"], capture_output=True, timeout=15)
-    _sp.run(["git", "-C", str(_gitdir), "commit", "-m", "init"], capture_output=True, timeout=15)
+    _sp.run(["git", "-C", str(_gitdir), "commit", "-m", "init"], capture_output=True,
+            timeout=15, check=True)
     cnr = core.create_campaign(fresh_state(), "目标", strategy="improve",
                                max_iterations=0, repo_path=str(_gitdir))
     core.advance_campaign(cnr, "本轮只讨论方案，未动代码。", fresh_state())
@@ -934,6 +941,19 @@ check("并发 4x15 入队无丢失（回归丢更新）", len(_rows) == 60, f"�
 check("并发写入无异常", not _errors, "; ".join(_errors[:2]))
 check("并发写入未造成文件损坏", isinstance(json.load(open(core.STATE_FILE, encoding="utf-8")), dict))
 check("可重入锁无长时间阻塞（嵌套获取<5s）", _elapsed < 30, f"耗时={_elapsed:.1f}s")
+
+# 同毫秒 id 不得碰撞：Linux CI 上两个活动同 id，推进甲会把乙一起推进
+_orig_tt = core.time.time
+core.time.time = lambda: 1793977000.123
+try:
+    fresh_state()
+    _ids19 = [core.create_campaign(core.load_state(), f"同毫秒{n}")["id"] for n in range(3)]
+    _tids19 = [core.add_task(core.load_state(), f"同毫秒任务{n}")["id"] for n in range(3)]
+finally:
+    core.time.time = _orig_tt
+check("同毫秒创建 3 个活动 id 唯一", len(set(_ids19)) == 3, f"ids={_ids19}")
+check("同毫秒创建 3 个任务 id 唯一", len(set(_tids19)) == 3, f"ids={_tids19}")
+fresh_state()
 
 # ================================================================ 19. advance_campaign 不写丢其他活动
 print("\n== 19. advance_campaign 并发合并写回 ==")

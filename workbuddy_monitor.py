@@ -932,6 +932,23 @@ def send_block_reason(task: dict, state: dict, cfg: dict, now=None) -> str:
 # ---------------------------------------------------------------------------
 # 任务队列
 # ---------------------------------------------------------------------------
+def _next_unique_id(items) -> int:
+    """毫秒时间戳做 id，但必须避开同毫秒内已存在的条目。
+
+    Linux CI 上连续创建任务/活动会落在同一毫秒，重复 id 会让 update_task /
+    campaign_by_id 命中错误对象（实测：两个活动 id 相同，推进甲把乙也推进了）。"""
+    cand = int(time.time() * 1000)
+    taken = set()
+    for it in items or []:
+        try:
+            taken.add(int(it.get("id")))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    while cand in taken:
+        cand += 1
+    return cand
+
+
 def add_task(state: dict, content: str, model: str = "", scheduled_time: str = None,
              allow_credit: bool = False):
     """添加任务。注意：始终从磁盘读最新状态再合并写回，
@@ -946,7 +963,6 @@ def add_task(state: dict, content: str, model: str = "", scheduled_time: str = N
         except ValueError:
             scheduled_time = None  # 格式非法则退化为立即
     task = {
-        "id": int(time.time() * 1000),
         "content": content,
         "model": model,
         "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -956,6 +972,7 @@ def add_task(state: dict, content: str, model: str = "", scheduled_time: str = N
     }
     with state_lock():
         fresh = load_state()
+        task["id"] = _next_unique_id(fresh.get("tasks"))
         fresh.setdefault("tasks", []).append(task)
         save_state(fresh)
         state["tasks"] = fresh["tasks"]  # 同步回调用方视图
@@ -1412,7 +1429,6 @@ def create_campaign(state, goal, strategy="improve", model="", stages=None,
     fresh = load_state()
     fresh_camps = ensure_campaigns(fresh)
     camp = {
-        "id": int(time.time() * 1000),
         "goal": goal.strip(),
         "strategy": strategy,
         "model": (model or "").strip(),
@@ -1438,6 +1454,7 @@ def create_campaign(state, goal, strategy="improve", model="", stages=None,
         "pause_reason": "",
         "paused_at": "",
     }
+    camp["id"] = _next_unique_id(fresh_camps)
     fresh_camps.append(camp)
     save_state(fresh)
     # 同步回调用方视图：保证内存与磁盘指向同一批对象，避免 campaign_by_id 命中旧副本
