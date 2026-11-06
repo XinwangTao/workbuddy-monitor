@@ -114,7 +114,7 @@ def drive_one_round(now):
     state = core.load_state()
     for t in core.pending_tasks(state):
         if core.task_sendable_now(t, state, cfg, now):
-            core.send_task(t, cfg)
+            core.send_task(t, cfg, now)
             state = core.load_state()
     core.run_iteration_step(state, cfg, now=now)
 

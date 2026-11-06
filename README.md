@@ -284,7 +284,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File create_shortcut.ps1
 无需真实 WorkBuddy 即可验证全部核心逻辑（CDP 用伪造模块注入，状态写入临时目录，不污染仓库）：
 
 ```bash
-python test_core.py          # 核心逻辑离线测试（435 项：fail-closed 门控、倍率解析、回复捕获、
+python test_core.py          # 核心逻辑离线测试（437 项：fail-closed 门控、倍率解析、回复捕获、
                              #   输入框焦点校验、autopilot 模型自定方向、回复清洗、并发写保护等）
 python test_e2e_real.py      # 实测：无 CDP 时回退/免费门控/白天不发送
 python test_e2e_cdp.py       # 实测：注入 Fake CDP 的「夜间 hy4 免费」自动迭代闭环

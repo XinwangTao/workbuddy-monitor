@@ -2274,6 +2274,20 @@ for _t in _st_ttl["tasks"]:
 core.save_state(_st_ttl)
 check("35d4 认领超时可被接管（进程崩溃不永久卡任务）",
       core._claim_task_for_send(_t_ttl["id"]) is True)
+# 35d5 被门控拦下的任务必须释放认领，否则 120s 内谁都不能重试
+_st35d = fresh_state()
+_st35d["model_catalog"] = [{"name": "NightOnly", "free": True, "multiplier": 0.29,
+                            "free_window": {"start": "23:00", "end": "08:00"}}]
+stamp(_st35d)
+core.save_state(_st35d)
+_t_block = core.add_task(core.load_state(), "白天被拦任务", model="NightOnly")
+core.send_task(_t_block, cfg_of(free_only=True), t_at(14, 0))
+_blk = next(t for t in core.load_state()["tasks"] if t["id"] == _t_block["id"])
+check("35d5 门控拦截后仍是 pending", _blk.get("status") == "pending",
+      f"实际={_blk.get('status')}")
+check("35d6 门控拦截后释放认领（可立即重试）",
+      not _blk.get("claimed_at") and core._claim_task_for_send(_t_block["id"]) is True,
+      f"claimed_at={_blk.get('claimed_at')!r}")
 fresh_state()  # 收尾
 
 # —— 35e. 人工恢复必须重置触发暂停的计数，否则恢复后下一轮立刻二次暂停 ——

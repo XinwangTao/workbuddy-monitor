@@ -2544,8 +2544,9 @@ def _clear_editor_leftover(needle: str) -> bool:
         return False
 
 
-def send_task(task: dict, cfg: dict):
+def send_task(task: dict, cfg: dict, now=None):
     mode = cfg.get("send_mode", "notify")
+    now = now or datetime.now()
     state = load_state()  # 发送前取最新状态（含 model_catalog / free_info）
     # 跨进程认领（GUI 监控 + 夜间 runner 共用同一份 state.json）：
     # 没有原子认领时两个进程都会通过"磁盘仍是 pending"检查并各发一次，
@@ -2561,8 +2562,11 @@ def send_task(task: dict, cfg: dict):
     # 发送前用最新状态再校验一次免费资格（状态可能在入队后变化：
     # 目录过期 / 模型被限流 / 余额守卫暂停 / 免费时段已过）。
     if cfg.get("auto_send", {}).get("free_only", True) and not task.get("allow_credit"):
-        block = free_gate_reason(task.get("model", ""), state, cfg)
+        block = free_gate_reason(task.get("model", ""), state, cfg, now)
         if block:
+            # 认领发生在门控之前，被拦下的任务不能一直占着认领位（120s 内
+            # 别的进程/GUI 会误以为"已被发送"）。释放后保持 pending 等下一轮。
+            update_task(task.get("id"), claimed_at=0, claimed_by="")
             log(f"任务 #{task['id']} 发送前拦截：{block}")
             return
     if mode == "command":
@@ -2585,9 +2589,9 @@ def send_task(task: dict, cfg: dict):
         if auto.get("enabled") and auto.get("free_only", True):
             # 免费额度保护：除非任务显式允许消耗积分，否则必须处于免费状态
             if not task.get("allow_credit"):
-                now = datetime.now()
                 if not is_model_free_now(task.get("model", ""), state, cfg, now):
-                    win = effective_free_window(state, task.get("model", ""))
+                    win = effective_free_window(state, task.get("model", ""), cfg)
+                    update_task(task.get("id"), claimed_at=0, claimed_by="")
                     log(f"任务 #{task['id']} 当前非免费时段/非免费模型"
                         f"（窗口 {win['start']}-{win['end']}），暂不发送")
                     return
@@ -2968,7 +2972,7 @@ def monitor_tick(cfg: dict, now=None) -> dict:
                           if x.get("id") == t.get("id") and x.get("status") == "pending"), None)
             if not still:
                 continue
-            send_task(t, cfg)
+            send_task(t, cfg, now)
             after = next((x for x in load_state().get("tasks", [])
                           if x.get("id") == t.get("id")), None)
             if after and after.get("status") == "sent":
