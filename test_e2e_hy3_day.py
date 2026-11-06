@@ -62,7 +62,7 @@ core.STATE_FILE = TMP / "state.json"
 core.CONFIG_FILE = TMP / "config.json"
 core.LOG_FILE = TMP / "monitor.log"
 # 真实窗口发送无法在无窗口时执行，mock 为成功（其余路径真实）
-core.auto_send_to_workbuddy = lambda content, title=None, model="": (True, "mocked-send")
+core.auto_send_to_workbuddy = lambda *a, **k: (True, "mocked-send")
 
 cfg = core.load_config()
 cfg.setdefault("auto_send", {})["enabled"] = True
@@ -107,10 +107,15 @@ camp_id = camp["id"]
 print(f"  创建 campaign #{camp_id} model=auto")
 
 def drive_one_round(now):
-    """严格复刻 run_loop：先发送所有可发的 pending 任务，再推进迭代。"""
+    """严格复刻 monitor_tick：先发送所有可发的 pending 任务，再推进迭代。
+
+    每步重新读盘；send_task 只写磁盘，旧 state 快照会让下一轮把已发送的
+    任务当成 pending，认领闸门拒绝后整轮空转。"""
+    state = core.load_state()
     for t in core.pending_tasks(state):
         if core.task_sendable_now(t, state, cfg, now):
             core.send_task(t, cfg)
+            state = core.load_state()
     core.run_iteration_step(state, cfg, now=now)
 
 print("\n" + "=" * 56)
@@ -118,12 +123,12 @@ print("实测D: 端到端自动迭代闭环（白天，跑 6 轮）")
 print("=" * 56)
 for i in range(6):
     drive_one_round(now)
-    c = core.campaign_by_id(state, camp_id)
+    c = core.campaign_by_id(core.load_state(), camp_id)
     print(f"  轮{i+1}: stage={c['stage_index']} iter={c['current_iteration']} "
           f"history={len(c['history'])} status={c['status']} "
           f"本轮所选模型={_select_log[-1] if _select_log else '-'}")
 
-final = core.campaign_by_id(state, camp_id)
+final = core.campaign_by_id(core.load_state(), camp_id)
 print("\n" + "=" * 56)
 print("实测E: 断言与结论")
 print("=" * 56)

@@ -13,6 +13,7 @@ CDP 依赖用伪造模块注入 sys.modules，因此无需真实 WorkBuddy 即�
 """
 import sys
 import json
+import ctypes
 import tempfile
 import types
 from datetime import datetime, timedelta
@@ -41,7 +42,12 @@ core.ORCH_LOCK_FILE = _TMP / "night-orchestrator.lock"
 # 使 auto_send 的“前台校验”在无副作用的前提下通过。
 core.set_clipboard_text = lambda text: True
 core._get_clipboard_text = lambda: ""
-core._find_window_by_title = lambda substr: core.user32.GetForegroundWindow()
+if core.user32 is not None:
+    # 真实前台句柄：让"前台窗口校验"在 Windows 上通过
+    core._find_window_by_title = lambda substr: core.user32.GetForegroundWindow()
+else:
+    # 非 Windows（CI）：产品跳过前台校验，用固定假句柄即可
+    core._find_window_by_title = lambda substr: 1
 core._activate_window = lambda hwnd: True
 core._ctrl_v = lambda: None
 core._enter = lambda: None
@@ -2536,8 +2542,14 @@ check("42b 同进程可重入", core.acquire_orchestrator_lock() is not None)
 import os as _os42  # noqa: E402
 core.ORCH_LOCK_FILE.write_text(
     json.dumps({"pid": _os42.getppid(), "started": _time.time()}), encoding="utf-8")
-check("42c 其他存活进程持锁→拿不到", core.acquire_orchestrator_lock() is None)
-check("42d 外部决策者被识别", core._external_orchestrator_active() is True)
+# 本地用「删掉 ctypes.windll」模拟 Linux 时，os.kill 在 Windows 上不是探测语义
+# （可能真去终止进程），不能安全验证；真实 CI 是 Linux，会正常走这两条。
+_simulated_non_windows = (_os42.name == "nt" and not hasattr(ctypes, "windll"))
+if _simulated_non_windows:
+    print("  (跳过 42c/42d：Windows 模拟无 windll 时无法安全探测 PID)")
+else:
+    check("42c 其他存活进程持锁→拿不到", core.acquire_orchestrator_lock() is None)
+    check("42d 外部决策者被识别", core._external_orchestrator_active() is True)
 core.ORCH_LOCK_FILE.write_text(
     json.dumps({"pid": 999999, "started": _time.time()}), encoding="utf-8")
 _tok42b = core.acquire_orchestrator_lock()

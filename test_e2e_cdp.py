@@ -58,7 +58,7 @@ core.STATE_FILE = TMP / "state.json"
 core.CONFIG_FILE = TMP / "config.json"
 core.LOG_FILE = TMP / "monitor.log"
 # 真实窗口发送无法在无窗口时执行，mock 为成功（其余路径真实）
-core.auto_send_to_workbuddy = lambda content, title=None, model="": (True, "mocked-send")
+core.auto_send_to_workbuddy = lambda *a, **k: (True, "mocked-send")
 
 cfg = core.load_config()
 # 模拟免费时段：临时把免费窗口设为覆盖当前时间（真实场景即夜里 23:00-08:00）
@@ -89,14 +89,16 @@ camp_id = camp["id"]
 print(f"  创建 campaign #{camp_id} model=Hy4")
 
 def drive_one_round(now):
-    """模拟 run_loop 一轮：标记上轮任务已完成 -> 发送 pending 任务 -> 迭代步进"""
-    c = core.campaign_by_id(state, camp_id)
-    if c.get("last_task_id"):
-        core.update_task(c["last_task_id"], status="sent")
+    """复刻 monitor_tick 一轮：先发可发的 pending -> 再推进迭代。
+
+    每步都重新读盘：send_task 只改磁盘，握着旧的 state 快照会让下一轮
+    继续看到已发送的任务，认领闸门拒绝后被误判成"未发送"。"""
+    state = core.load_state()
     for t in core.pending_tasks(state):
         if core.task_sendable_now(t, state, cfg, now):
             core.send_task(t, cfg)
-    core.run_iteration_step(state, cfg, now=now)
+            state = core.load_state()
+    core.run_iteration_step(state, cfg, now)
 
 now = datetime(2026, 9, 23, 23, 30)  # 夜间语义时间
 print("\n" + "=" * 56)
@@ -104,11 +106,11 @@ print("实测C: 端到端自动迭代闭环（跑 6 轮）")
 print("=" * 56)
 for i in range(6):
     drive_one_round(now)
-    c = core.campaign_by_id(state, camp_id)
+    c = core.campaign_by_id(core.load_state(), camp_id)
     print(f"  轮{i+1}: stage={c['stage_index']} iter={c['current_iteration']} "
           f"history={len(c['history'])} status={c['status']} 已选模型={_select_log[-1] if _select_log else '-'}")
 
-final = core.campaign_by_id(state, camp_id)
+final = core.campaign_by_id(core.load_state(), camp_id)
 print("\n" + "=" * 56)
 print("实测D: 断言与结论")
 print("=" * 56)

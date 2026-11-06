@@ -47,7 +47,11 @@ def check(name, cond, detail=""):
 
 
 print("== GUI 构建冒烟 ==")
-root = tk.Tk()
+try:
+    root = tk.Tk()
+except Exception as e:  # 无 DISPLAY（CI/headless）时 Tk 初始化失败，按跳过处理
+    print(f"跳过：无法创建 Tk 窗口（{e}）")
+    sys.exit(0)
 root.withdraw()  # 不实际显示窗口
 
 app = gui.App(root)

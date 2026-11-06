@@ -95,9 +95,13 @@ DEFAULT_CONFIG = {
 
 # 弹窗（置顶 MessageBox，比气泡通知更醒目，用于余额报警等紧急场景）
 def show_alert_popup(title: str, body: str):
-    import ctypes
-    # MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST = 0x30 | 0x10000 | 0x40000
-    ctypes.windll.user32.MessageBoxW(0, body, title, 0x30 | 0x10000 | 0x40000)
+    # 非 Windows（CI 跑在 ubuntu）没有 windll，弹窗降级为日志，不能让调用方崩
+    try:
+        import ctypes
+        # MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST = 0x30 | 0x10000 | 0x40000
+        ctypes.windll.user32.MessageBoxW(0, body, title, 0x30 | 0x10000 | 0x40000)
+    except Exception as e:
+        log(f"弹窗不可用（{e}）：{title} - {body}")
 
 
 def load_config() -> dict:
@@ -994,10 +998,29 @@ _LAST_OBSERVE_LOG = {"at": 0.0}
 
 
 def _pid_alive(pid) -> bool:
-    """进程是否仍存活（Windows；取不到时按不存活处理，允许接管过期锁）。"""
+    """进程是否仍存活；取不到时按不存活处理，允许接管过期锁。
+
+    POSIX（CI 的 ubuntu runner）没有 windll，用 os.kill(pid, 0) 探测：
+    PermissionError 说明进程存在但属于别人，仍算存活。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
     try:
         k = ctypes.windll.kernel32
-        h = k.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+        h = k.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
         if h:
             k.CloseHandle(h)
             return True
@@ -1993,45 +2016,60 @@ def send_windows_notification(title: str, body: str):
 # 自动发送：剪贴板 + 激活 WorkBuddy 窗口 + Ctrl+V + Enter（纯 ctypes，无第三方依赖）
 # ---------------------------------------------------------------------------
 import ctypes
-import ctypes.wintypes as _wt
 
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
-# 64 位下必须声明正确的返回/参数类型，否则句柄被截断导致写入违规
-kernel32.GlobalAlloc.restype = ctypes.c_void_p
-kernel32.GlobalAlloc.argtypes = (ctypes.c_uint, ctypes.c_size_t)
-kernel32.GlobalLock.restype = ctypes.c_void_p
-kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
-kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
-user32.SetClipboardData.restype = ctypes.c_void_p
-user32.SetClipboardData.argtypes = (ctypes.c_uint, ctypes.c_void_p)
-user32.GetClipboardData.restype = ctypes.c_void_p
-user32.GetClipboardData.argtypes = (ctypes.c_uint,)
-# _activate_window 加固用：显式原型，避免 64 位指针截断
-user32.SetForegroundWindow.restype = ctypes.c_int
-user32.SetForegroundWindow.argtypes = (ctypes.c_void_p,)
-user32.GetWindowThreadProcessId.restype = ctypes.c_uint
-user32.GetWindowThreadProcessId.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint))
-user32.AttachThreadInput.restype = ctypes.c_int
-user32.AttachThreadInput.argtypes = (ctypes.c_uint, ctypes.c_uint, ctypes.c_int)
-kernel32.GetCurrentThreadId.restype = ctypes.c_uint
-kernel32.GetCurrentThreadId.argtypes = ()
-user32.BringWindowToTop.restype = ctypes.c_int
-user32.BringWindowToTop.argtypes = (ctypes.c_void_p,)
-# 窗口归属校验用：按 hwnd 取进程映像名 / 窗口类名
-kernel32.OpenProcess.restype = ctypes.c_void_p
-kernel32.OpenProcess.argtypes = (_wt.DWORD, _wt.BOOL, _wt.DWORD)
-kernel32.QueryFullProcessImageNameW.restype = _wt.BOOL
-kernel32.QueryFullProcessImageNameW.argtypes = (
-    ctypes.c_void_p, _wt.DWORD, _wt.LPWSTR, ctypes.POINTER(_wt.DWORD))
-kernel32.CloseHandle.restype = _wt.BOOL
-kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-user32.GetClassNameW.restype = ctypes.c_int
-user32.GetClassNameW.argtypes = (ctypes.c_void_p, _wt.LPWSTR, ctypes.c_int)
+_windows_api_ready = False
+try:
+    import ctypes.wintypes as _wt
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    _windows_api_ready = True
+except (AttributeError, ImportError, OSError):
+    # 非 Windows（CI 的 ubuntu runner）没有 windll/wintypes。这里不能炸：
+    # test_core 等纯逻辑测试必须先能 import；窗口自动化/剪贴板在调用处按
+    # 「不可用」返回失败，绝不盲发。
+    _wt = None
+    user32 = None
+    kernel32 = None
+    log("当前平台无 Windows 窗口/剪贴板 API，自动发送不可用（测试环境属正常）")
+
+if _windows_api_ready:
+    # 64 位下必须声明正确的返回/参数类型，否则句柄被截断导致写入违规
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = (ctypes.c_uint, ctypes.c_size_t)
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.SetClipboardData.argtypes = (ctypes.c_uint, ctypes.c_void_p)
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    user32.GetClipboardData.argtypes = (ctypes.c_uint,)
+    # _activate_window 加固用：显式原型，避免 64 位指针截断
+    user32.SetForegroundWindow.restype = ctypes.c_int
+    user32.SetForegroundWindow.argtypes = (ctypes.c_void_p,)
+    user32.GetWindowThreadProcessId.restype = ctypes.c_uint
+    user32.GetWindowThreadProcessId.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint))
+    user32.AttachThreadInput.restype = ctypes.c_int
+    user32.AttachThreadInput.argtypes = (ctypes.c_uint, ctypes.c_uint, ctypes.c_int)
+    kernel32.GetCurrentThreadId.restype = ctypes.c_uint
+    kernel32.GetCurrentThreadId.argtypes = ()
+    user32.BringWindowToTop.restype = ctypes.c_int
+    user32.BringWindowToTop.argtypes = (ctypes.c_void_p,)
+    # 窗口归属校验用：按 hwnd 取进程映像名 / 窗口类名
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = (_wt.DWORD, _wt.BOOL, _wt.DWORD)
+    kernel32.QueryFullProcessImageNameW.restype = _wt.BOOL
+    kernel32.QueryFullProcessImageNameW.argtypes = (
+        ctypes.c_void_p, _wt.DWORD, _wt.LPWSTR, ctypes.POINTER(_wt.DWORD))
+    kernel32.CloseHandle.restype = _wt.BOOL
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.GetClassNameW.argtypes = (ctypes.c_void_p, _wt.LPWSTR, ctypes.c_int)
 
 
 def set_clipboard_text(text: str) -> bool:
     """把文本写入系统剪贴板（CF_UNICODETEXT）"""
+    if user32 is None:
+        return False
     if not user32.OpenClipboard(0):
         return False
     try:
@@ -2114,6 +2152,8 @@ def _window_is_candidate(title, cls, exe, want="workbuddy") -> bool:
 
 def _find_window_by_title(substr: str):
     """枚举顶层窗口，返回真正的 WorkBuddy 窗口句柄（排除终端/路径同名窗口）。"""
+    if user32 is None:
+        return None
     result = []
     @ctypes.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM)
     def cb(hwnd, _):
@@ -2138,6 +2178,8 @@ def _activate_window(hwnd) -> bool:
        共享输入状态后再切换（经典绕过，最稳）；
     3. 全部失败返回 False，调用方据此取消发送，绝不盲发。"""
     if not hwnd:
+        return False
+    if user32 is None:
         return False
     user32.ShowWindow(hwnd, 9)  # SW_RESTORE
     # ALT 键 up/down 各一次，绕过 SetForegroundWindow 限制
@@ -2185,6 +2227,8 @@ def _enter():
 
 def _get_clipboard_text() -> str:
     """读取当前剪贴板文本（用于发送后还原）"""
+    if user32 is None:
+        return ""
     if not user32.OpenClipboard(0):
         return ""
     try:
@@ -2277,8 +2321,10 @@ def auto_send_to_workbuddy(content: str, window_title: str = "WorkBuddy",
         _restore_clipboard(prev_clip)
         return False, "无法激活 WorkBuddy 窗口"
     time.sleep(0.5)
-    # 发送前二次确认前台就是目标窗口，防止把内容打进无关应用
-    if user32.GetForegroundWindow() != hwnd:
+    # 发送前二次确认前台就是目标窗口，防止把内容打进无关应用。
+    # 非 Windows 没有前台概念（_activate_window 已按失败处理，正常流程到不了这里），
+    # 这里保留防御：无可用的 user32 时不做平台前置判断。
+    if user32 is not None and user32.GetForegroundWindow() != hwnd:
         _restore_clipboard(prev_clip)
         return False, "前台窗口校验失败，取消发送"
     # 关键修复 1：激活窗口 ≠ 焦点在输入框。真实出现过「窗口在前台但
